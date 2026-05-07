@@ -1,0 +1,13 @@
+{
+  "example": {
+    "exe": "C:/path/to/game/Game.exe",
+    "working_dir": "C:/path/to/game",
+    "capture_file": "captures/{name}_{ts}.gcap",
+    "options": {
+      "ref-all-resources": false,
+      "capture-all-cmd-lists": true,
+      "hook-children": false,
+      "api-validation": false
+    }
+  }
+}

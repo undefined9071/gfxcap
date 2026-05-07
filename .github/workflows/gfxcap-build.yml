@@ -1,0 +1,242 @@
+name: gfxcap-build
+
+# Production CI: rebrand + MinHook on the v140 (VS2015) toolset. v140 is
+# required for the resulting PE shape to match the upstream baldurk
+# distribution, which is what makes a third-party AC's PE-shape check
+# accept the DLL at inject time. MinHook + a d3d11/dxgi allowlist keeps
+# a userspace AC library from interfering with the DLL after inject.
+# The combination yields a single binary that works across the tested
+# targets.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths:
+      - '.gfxcap/**'
+      - '.github/workflows/gfxcap-build.yml'
+      - 'qrenderdoc/**'
+      - 'renderdoc/**'
+      - 'renderdoccmd/**'
+      - 'renderdocshim/**'
+      - 'renderdoc.sln'
+  pull_request:
+    paths:
+      - '.gfxcap/**'
+      - '.github/workflows/gfxcap-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # softprops/action-gh-release needs this for tag pushes
+
+jobs:
+  windows:
+    # Pin to the VS2026-bearing image now that GHA is redirecting
+    # `windows-2025` -> `windows-2025-vs2026` (May 12 2026 cut-over).
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 5
+          submodules: recursive
+
+      # Git for Windows ships a `patch.exe` we use to apply rdc-cli's gfxcap
+      # fallback. Strawberry Perl's older patch is on PATH first on the GHA
+      # runner; force ours.
+      - name: Make Git for Windows patch.exe primary
+        shell: bash
+        run: echo 'C:\Program Files\Git\usr\bin' >> $GITHUB_PATH
+
+      - name: Install VC.140 components
+        shell: powershell
+        run: |
+          # Locate the host VS install dynamically via vswhere so this works
+          # across image cut-overs (windows-2025 -> windows-2025-vs2026 etc.)
+          # without hard-coding the major-version-bearing path.
+          $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+              Write-Error "vswhere.exe not found at $vswhere"
+              exit 1
+          }
+          $InstallPath = & $vswhere -latest -property installationPath
+          if (-not $InstallPath) {
+              Write-Error "vswhere returned no installationPath"
+              exit 1
+          }
+          Write-Host "Host VS install: $InstallPath"
+
+          Set-Location "C:\Program Files (x86)\Microsoft Visual Studio\Installer\"
+          $components = @(
+              "Microsoft.VisualStudio.Component.VC.140",
+              "Microsoft.VisualStudio.Component.VC.14.29.16.11.ATL"
+          )
+          [string]$workloadArgs = $components | ForEach-Object { " --add " + $_ }
+          $Arguments = ('/c', "vs_installer.exe", 'modify', '--installPath', "`"$InstallPath`"", $workloadArgs, '--quiet', '--norestart', '--nocache')
+          # run twice -- the upstream baldurk CI does this because the first
+          # pass occasionally leaves the install incomplete.
+          Start-Process -FilePath cmd.exe -ArgumentList $Arguments -Wait -PassThru -WindowStyle Hidden
+          Start-Process -FilePath cmd.exe -ArgumentList $Arguments -Wait -PassThru -WindowStyle Hidden
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - uses: microsoft/setup-msbuild@v3
+
+      - name: Prepare working tree (rebrand + MinHook, keep v140)
+        working-directory: .gfxcap
+        run: python scripts/prepare.py --clean --no-retarget
+
+      # Direct msbuild on the rebrand-applied sln. We deliberately bypass
+      # build.py here because every /p: override we tried under v140
+      # (SupportJustMyCode, MultiProcessorCompilation, PreferredToolArchitecture)
+      # interacted badly with PCH generation. The bare upstream invocation
+      # works.
+      - name: Build solution (v140)
+        shell: powershell
+        working-directory: .gfxcap/build/src
+        run: msbuild.exe gfxcap.sln "/m" "/p:Configuration=Release" "/p:Platform=x64" "/p:PlatformToolset=v140"
+
+      # Read the PE Optional Header's MajorLinkerVersion / MinorLinkerVersion
+      # off the build outputs and require 14.00 (= the v140 toolset's link.exe
+      # signature). If the host VS image flips us back to a v143 link.exe by
+      # accident -- e.g. v140 install silently failed and msbuild fell through
+      # to the host toolset -- this step catches it before we ship a binary
+      # whose PE shape gets rejected by the AC PE-shape check at inject time.
+      - name: Verify v140 linker signature on built binaries
+        shell: powershell
+        run: |
+          $rel = ".gfxcap\build\src\x64\Release"
+          $targets = @("gfxcap.dll", "gfxcapui.exe", "gfxcapcmd.exe", "gfxcapshim64.dll")
+          $bad = @()
+          foreach ($t in $targets) {
+              $p = Join-Path $rel $t
+              if (-not (Test-Path $p)) {
+                  Write-Error "missing build output: $p"
+                  exit 1
+              }
+              $bytes = [System.IO.File]::ReadAllBytes($p)
+              $peOff  = [BitConverter]::ToInt32($bytes, 0x3c)
+              $optOff = $peOff + 24
+              $major  = $bytes[$optOff + 2]
+              $minor  = $bytes[$optOff + 3]
+              Write-Host ("{0,-22} linker {1}.{2:D2}" -f $t, $major, $minor)
+              if ($major -ne 14 -or $minor -ne 0) {
+                  # ${t}: braces required so PS doesn't parse "$t:" as a drive ref
+                  $bad += "${t}: $major.$minor"
+              }
+          }
+          if ($bad.Count -gt 0) {
+              Write-Error ("Expected linker 14.00 (v140 toolset). Mismatches: " + ($bad -join ", "))
+              exit 1
+          }
+          Write-Host "all targets have linker 14.00 (v140) -- PE shape OK"
+
+      - name: Stage portable bundle
+        id: stage
+        shell: pwsh
+        run: |
+          if ('${{ github.ref_type }}' -eq 'tag') {
+            $version = '${{ github.ref_name }}'
+          } else {
+            $sha = '${{ github.sha }}'.Substring(0,7)
+            $version = "dev-$sha"
+          }
+          $name = "gfxcap-windows-x64-$version"
+          $stage = ".gfxcap\dist\$name"
+          $rel   = ".gfxcap\build\src\x64\Release"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          # Required runtime files from the build output.
+          # PDBs are deliberately omitted -- ~230 MB combined and only useful
+          # for debugger crash analysis, not for running the bundle or for
+          # gfxcli dump consumers.
+          $required = @(
+            "gfxcap.dll",
+            "gfxcapcmd.exe",
+            "gfxcapshim64.dll",
+            "gfxcapui.exe",
+            "python36.dll", "python36.zip",
+            "Qt5Core.dll", "Qt5Gui.dll", "Qt5Network.dll", "Qt5Svg.dll", "Qt5Widgets.dll"
+          )
+          # gfxcap.pyd lives under pymodules/, ship it next to gfxcap.dll so
+          # analysis/gfxcli.py imports it as `gfxcap`.
+          $pydSrc = Join-Path $rel "pymodules\gfxcap.pyd"
+          if (Test-Path $pydSrc) { Copy-Item $pydSrc $stage -Force }
+          foreach ($f in $required) {
+            $src = Join-Path $rel $f
+            if (Test-Path $src) { Copy-Item $src $stage -Force }
+            else { Write-Warning "missing in build output: $f" }
+          }
+          # Qt platform plugins (qwindows.dll etc.) — qrenderdoc.vcxproj
+          # deposits these under qtplugins/.
+          $plugins = Join-Path $rel "qtplugins"
+          if (Test-Path $plugins) {
+            Copy-Item -Path $plugins -Destination $stage -Recurse -Force
+          }
+
+          # Bundle vendored shader plugins (HLSL Decompiler etc.) under
+          # plugins/<name>/ next to the exe. The Load() in PersistantConfig
+          # auto-registers any HLSLDecompiler.bat it finds at
+          # plugins/hlsl-decompiler/.
+          $vendoredPlugins = ".gfxcap\3rdparty\hlsl-decompiler"
+          if (Test-Path $vendoredPlugins) {
+            $pluginsDst = Join-Path $stage "plugins\hlsl-decompiler"
+            New-Item -ItemType Directory -Force -Path $pluginsDst | Out-Null
+            Copy-Item -Path "$vendoredPlugins\*" -Destination $pluginsDst -Recurse -Force
+          }
+
+          # AI-friendly export tooling.
+          # gfxcap.pyd is built against the embedded Python 3.6 from
+          # qrenderdoc/3rdparty/python, so the analyser side ships a
+          # matching Python 3.6 embed and a self-contained export script.
+          # rdc-cli was evaluated and rejected (Python 3.10+ requirement
+          # is incompatible with our 3.6-locked SWIG module).
+          $analysisDst = Join-Path $stage "analysis"
+          New-Item -ItemType Directory -Force -Path $analysisDst | Out-Null
+
+          $pyEmbedZip = Join-Path $env:RUNNER_TEMP "py36embed.zip"
+          curl.exe -L -o $pyEmbedZip "https://www.python.org/ftp/python/3.6.8/python-3.6.8-embed-amd64.zip"
+          $pyEmbedDir = Join-Path $analysisDst "python36"
+          New-Item -ItemType Directory -Force -Path $pyEmbedDir | Out-Null
+          Expand-Archive -Path $pyEmbedZip -DestinationPath $pyEmbedDir -Force
+
+          # Export script + skill + design doc ship under analysis/ next
+          # to the embed. gfxcli.py is the single-file CLI (subcommands:
+          # dump, list); DESIGN.md documents the output layout and the
+          # failure-handling contract.
+          if (Test-Path ".gfxcap\src\scripts\gfxcli.py") {
+            Copy-Item ".gfxcap\src\scripts\gfxcli.py" $analysisDst -Force
+          }
+          if (Test-Path ".gfxcap\src\scripts\DESIGN.md") {
+            Copy-Item ".gfxcap\src\scripts\DESIGN.md" $analysisDst -Force
+          }
+          if (Test-Path ".gfxcap\skills\SKILL.md") {
+            Copy-Item ".gfxcap\skills\SKILL.md" $analysisDst -Force
+          }
+
+          $zip = ".gfxcap\dist\$name.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip
+          Get-ChildItem $zip | Format-List Name, Length
+
+          "version=$version"     | Out-File $env:GITHUB_OUTPUT -Append
+          "bundle_name=$name"    | Out-File $env:GITHUB_OUTPUT -Append
+          "zip_path=$zip"        | Out-File $env:GITHUB_OUTPUT -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.stage.outputs.bundle_name }}
+          path: ${{ steps.stage.outputs.zip_path }}
+          retention-days: 14
+
+      - name: Publish to Release (tag only)
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ steps.stage.outputs.zip_path }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

@@ -1,0 +1,48 @@
+Add MinHook source files to gfxcap.vcxproj for static linking into gfxcap.dll.
+
+MinHook is vendored under .gfxcap/3rdparty/minhook/ and merged into the work
+tree by prepare.py. The header is exposed via the existing 3rdparty\ include
+path used by the renamed library project:
+    #include "minhook/include/MinHook.h"
+
+MinHook is C; gfxcap is C++ with PCH and force-included precompiled.h.
+Per-file PrecompiledHeader=NotUsing + empty ForcedIncludeFiles cleans both.
+TreatWarningAsError=false because MinHook has minor warnings (unused vars
+etc.) that we don't want to fix in upstream 3rdparty code.
+
+Subject: [PATCH] minhook: compile sources into gfxcap.dll
+
+--- a/gfxcap/gfxcap.vcxproj
++++ b/gfxcap/gfxcap.vcxproj
+@@ -253,7 +253,31 @@
+     <ClInclude Include="serialise\zstdio.h" />
+     <ClInclude Include="strings\string_utils.h" />
+   </ItemGroup>
+   <ItemGroup>
++    <ClCompile Include="3rdparty\minhook\src\buffer.c">
++      <PrecompiledHeader>NotUsing</PrecompiledHeader>
++      <ForcedIncludeFiles>
++      </ForcedIncludeFiles>
++      <TreatWarningAsError>false</TreatWarningAsError>
++    </ClCompile>
++    <ClCompile Include="3rdparty\minhook\src\hook.c">
++      <PrecompiledHeader>NotUsing</PrecompiledHeader>
++      <ForcedIncludeFiles>
++      </ForcedIncludeFiles>
++      <TreatWarningAsError>false</TreatWarningAsError>
++    </ClCompile>
++    <ClCompile Include="3rdparty\minhook\src\trampoline.c">
++      <PrecompiledHeader>NotUsing</PrecompiledHeader>
++      <ForcedIncludeFiles>
++      </ForcedIncludeFiles>
++      <TreatWarningAsError>false</TreatWarningAsError>
++    </ClCompile>
++    <ClCompile Include="3rdparty\minhook\src\hde\hde64.c">
++      <PrecompiledHeader>NotUsing</PrecompiledHeader>
++      <ForcedIncludeFiles>
++      </ForcedIncludeFiles>
++      <TreatWarningAsError>false</TreatWarningAsError>
++    </ClCompile>
+     <ClCompile Include="3rdparty\catch\catch.cpp" />
+     <ClCompile Include="3rdparty\compressonator\BC1_Encode_kernel.cpp" />
+     <ClCompile Include="3rdparty\compressonator\BC2_Encode_kernel.cpp" />

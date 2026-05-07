@@ -44,3 +44,12 @@
 # Specific files that should be left alone
 renderdoccmd/resource.h binary
 renderdoc/data/resource.h binary
+
+# === gfxcap-rebuild additions ===
+# Always keep our README on upstream merges; never accept upstream's version.
+README.md merge=ours
+
+# Pin LF for our scripts/patches/workflows (avoid CRLF surprises on contributors).
+.gfxcap/scripts/**/*.py text eol=lf
+.gfxcap/patches/**/*.patch text eol=lf
+.github/workflows/*.yml text eol=lf

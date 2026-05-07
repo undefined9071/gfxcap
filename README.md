@@ -1,74 +1,112 @@
-<p align="center"><img src="https://user-images.githubusercontent.com/661798/36482670-f81601c0-170b-11e8-8adb-2365b346ac27.png" /></p>
+# gfxcap
 
-[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
-[![CI](https://github.com/baldurk/renderdoc/actions/workflows/ci.yml/badge.svg?branch=v1.x&event=push)](https://github.com/baldurk/renderdoc/actions)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-v2.0%20adopted-ff69b4.svg)](docs/CODE_OF_CONDUCT.md) 
+A fork of [RenderDoc](https://github.com/baldurk/renderdoc).
 
-RenderDoc is a frame-capture based graphics debugger, currently available for Vulkan, D3D11, D3D12, OpenGL, and OpenGL ES development on Windows, Linux, Android, and Nintendo Switch&trade;. It is completely open-source under the MIT license.
+The fork keeps every upstream feature and adds a small set of changes that
+make RenderDoc usable on D3D11 titles whose anti-cheat / debug-layer guards
+get in the way of stock RenderDoc:
 
-RenderDoc is intended for debugging your own programs only. Any discussion of capturing programs that you did not create will not be allowed in any official public RenderDoc setting, including the issue tracker, discord, or via email. For example this includes capturing commercial games that you did not create, or capturing Google Maps or Google Earth. Note: Capturing projects you created that use a third party engine like Unreal or Unity, or open source and free projects is completely fine and supported.
+- Rebrands the binaries, log paths, registry keys, and file associations
+  to hide the `renderdoc` string. The approach is borrowed from
+  [ShiyumeMeguri/FractalMiner/Nisemono.py](https://github.com/ShiyumeMeguri/FractalMiner/blob/main/Assets/Scenes/Nisemono.py).
+- Pins the v140 (VS2015) toolset in the build pipeline. For reasons we
+  don't fully understand, some target processes refuse to take an
+  injection unless the DLL was linked with v140.
+- MinHook-based hooking with a d3d11 / dxgi allowlist instead of
+  upstream's loader-wide IAT patching, so userspace anti-cheat libraries
+  don't trip on modifications to unrelated import tables.
+- F12 captures persist on disk under `./captures/*.rdc` next to the
+  executable. They are never auto-deleted.
+- The bundled HLSL Decompiler plugin is auto-registered on first launch.
+- Single-event export CLI (`gfxcli`) produces an LLM-readable Markdown
+  bundle describing every state input the GPU saw at one draw or
+  dispatch.
 
-If you have any questions, suggestions or problems or you can [create an issue](https://github.com/baldurk/renderdoc/issues/new/choose) here on github, [email me directly](mailto:baldurk@baldurk.org) or come into [IRC](https://webchat.oftc.net/?channels=renderdoc) or [Discord](https://discord.gg/ahq6yRB) to discuss it.
+## License
 
-To install on windows run the appropriate installer for your OS ([64-bit](https://renderdoc.org/stable/latest/RenderDoc_latest_64.msi) | [32-bit](https://renderdoc.org/stable/latest/RenderDoc_latest_32.msi)) or download the portable zip from the [builds page](https://renderdoc.org/builds). The 64-bit windows build fully supports capturing from 32-bit programs. On linux only 64-bit x86 is supported - there is a precompiled [binary tarball](https://renderdoc.org/stable/latest/renderdoc_latest.tar.gz) available, or your distribution may package it. If not you can [build from source](docs/CONTRIBUTING/Compiling.md).
+MIT, same as upstream RenderDoc — see [`LICENSE.md`](LICENSE.md). Bundled
+third-party plugins keep their own licenses (see the directories under
+`.gfxcap/3rdparty/` for the corresponding notices):
 
-* **Downloads**: Stable and nightly builds: https://renderdoc.org/builds ( [Symbol server](https://renderdoc.org/symbols) )
-* **Documentation**: [HTML online](https://renderdoc.org/docs), [CHM in builds](https://renderdoc.org/docs/renderdoc.chm), [Videos](https://www.youtube.com/user/baldurkarlsson)
-* **Contact**: [baldurk@baldurk.org](mailto:baldurk@baldurk.org), [#renderdoc on OFTC IRC](https://webchat.oftc.net/?channels=renderdoc), [Discord server](https://discord.gg/ahq6yRB)
-* **Code of Conduct**: [Contributor Covenant](docs/CODE_OF_CONDUCT.md)
-* **Information for contributors**: [All contribution information](docs/CONTRIBUTING.md), [Compilation instructions](docs/CONTRIBUTING/Compiling.md)
-* **Community extensions**: [Extensions repository](https://github.com/baldurk/renderdoc-contrib)
+- **[MinHook](https://github.com/TsudaKageyu/minhook)** by Tsuda Kageyu —
+  MIT. Vendored under `.gfxcap/3rdparty/minhook/`. Used as the inline-hook
+  engine in place of upstream's IAT-patching loader hooks.
+- **[HLSL-Decompiler](https://github.com/YYadorigi/HLSL-Decompiler)** by
+  YYadorigi. Bundled at `.gfxcap/3rdparty/hlsl-decompiler/` and
+  auto-registered as the DXBC/DXIL → HLSL decompiler plugin.
 
-Screenshots
---------------
+## Build
 
-| [ ![Texture view](https://renderdoc.org/fp/ts_screen1.jpg?2) ](https://renderdoc.org/fp/screen1.jpg) | [ ![Pixel history & shader debug](https://renderdoc.org/fp/ts_screen2.jpg?2) ](https://renderdoc.org/fp/screen2.png) |
-| --- | --- |
-| [ ![Mesh viewer](https://renderdoc.org/fp/ts_screen3.jpg?2) ](https://renderdoc.org/fp/screen3.png) | [ ![Pipeline viewer & constants](https://renderdoc.org/fp/ts_screen4.jpg?2) ](https://renderdoc.org/fp/screen4.png) |
+The authoritative build recipe is the CI workflow at
+[`.github/workflows/gfxcap-build.yml`](.github/workflows/gfxcap-build.yml).
+It pins the v140 toolset, applies the source edits in
+`.gfxcap/scripts/source_edits.py`, builds the rebranded solution on the
+GitHub-hosted Windows runner, verifies the resulting binaries' PE linker
+version, and ships a portable bundle as a release artifact.
 
-API Support
---------------
+For a local build, install Visual Studio (any 2022 or newer) plus the
+`Microsoft.VisualStudio.Component.VC.140` and
+`Microsoft.VisualStudio.Component.VC.14.29.16.11.ATL` components, then run:
 
-|                          | Windows                  | Linux                    | Android                   |
-| ------------------------ | ------------------------ | ------------------------ | ------------------------  |
-| Vulkan                   | :heavy_check_mark:       | :heavy_check_mark:       | :heavy_check_mark:        |
-| OpenGL ES 2.0 - 3.2      | :heavy_check_mark:       | :heavy_check_mark:       | :heavy_check_mark:        |
-| OpenGL 3.2 - 4.6 Core    | :heavy_check_mark:       | :heavy_check_mark:       |  N/A                      |
-| D3D11 & D3D12            | :heavy_check_mark:       |  N/A                     |  N/A                      |
-| OpenGL 1.0 - 2.0 Compat  | :heavy_multiplication_x: | :heavy_multiplication_x: |  N/A                      |
-| D3D9 & 10                | :heavy_multiplication_x: |  N/A                     |  N/A                      |
-| Metal                    |  N/A                     |  N/A                     |  N/A                      |
+```powershell
+python .gfxcap/scripts/prepare.py --clean --no-retarget
+msbuild .gfxcap/build/src/gfxcap.sln /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v140
+```
 
-* Nintendo Switch&trade; support is distributed separately for authorized developers as part of the NintendoSDK. For more information, consult the Nintendo Developer Portal.
+## Usage
 
-Downloads
---------------
+1. Download the bundle from the latest release (or build it yourself).
+2. Run `gfxcapui.exe` and use **File → Launch Application** targeting the
+   executable to capture.
+3. Press F12 in the running application to take a frame capture. The capture
+   file is written to `<exe-dir>/captures/` and the GUI auto-loads it.
 
-There are [binary releases](https://renderdoc.org/builds) available, built from the release targets. If you just want to use the program and you ended up here, this is what you want :).
+### When `Launch Application` doesn't work
 
-It's recommended that if you're new you start with the stable builds. Nightly builds are available every day from the [v1.x branch here](https://renderdoc.org/builds#nightly) if you need it, but correspondingly may be less stable.
+For titles that reject gfxcap's launch path (e.g. some Steam games),
+side-load `gfxcap.dll` manually with a proxy DLL such as
+[VersionShim](https://github.com/Xpl0itR/VersionShim). Captures land
+in `./captures/*.rdc` next to the target exe.
 
-Documentation
---------------
+## Bundled plugins
 
-The text documentation is available [online for the latest stable version](https://renderdoc.org/docs/), as well as in [renderdoc.chm](https://renderdoc.org/docs/renderdoc.chm) in any build. It's built from [restructured text with sphinx](docs).
+- `plugins/hlsl-decompiler/` — DXBC / DXIL → HLSL decompiler. Auto-registered
+  on first launch via the bundled `HLSLDecompiler.bat`.
 
-As mentioned above there are some [youtube videos](https://www.youtube.com/user/baldurkarlsson) showing the use of some basic features and an introduction/overview.
+## CLI: `gfxcli`
 
-There is also a great presentation by [@Icetigris](https://twitter.com/Icetigris) which goes into some details of how RenderDoc can be used in real world situations: [slides are up here](https://docs.google.com/presentation/d/1LQUMIld4SGoQVthnhT1scoA3k4Sg0as14G4NeSiSgFU/edit#slide=id.p).
+`gfxcli` is shipped under `analysis/` in the portable bundle alongside an
+embedded Python 3.6 (matched to `gfxcap.pyd`'s ABI). It exports the full GPU
+pipeline state for one event into a self-contained Markdown directory:
 
-License
---------------
+```
+analysis\python36\python.exe analysis\gfxcli.py dump --rdc <capture>.rdc --eid <event-id>
+```
 
-RenderDoc is released under the MIT license, see [LICENSE.md](LICENSE.md) for full text as well as 3rd party library acknowledgements.
+The output directory contains:
 
-Compiling
----------
+- per-stage shader bytecode + DXBC disassembly + decompiled HLSL
+- per-binding constant buffer values (decoded variables alongside the raw
+  bytes so an LLM can crosscheck decode against ground truth)
+- bound textures (DDS + PNG) and buffers (raw `.bin`)
+- input assembly, output merger, rasterizer state
+- a coverage report and per-target failure log so partial failures cannot
+  go unnoticed
 
-Building RenderDoc is fairly straight forward on most platforms. See [Compiling.md](docs/CONTRIBUTING/Compiling.md) for more details.
+See [`.gfxcap/src/scripts/DESIGN.md`](.gfxcap/src/scripts/DESIGN.md) for the
+output layout reference and the per-file Markdown templates.
 
-Contributing & Development
---------------
+## Skill (for AI agents)
 
-I've added some notes on how to contribute, as well as where to get started looking through the code in [Developing-Change.md](docs/CONTRIBUTING/Developing-Change.md). All contribution information is available under [CONTRIBUTING.md](docs/CONTRIBUTING.md).
+[`.gfxcap/skills/SKILL.md`](.gfxcap/skills/SKILL.md) is a skill description
+so an AI agent can invoke `gfxcli dump` automatically when asked to inspect
+a specific draw call from a capture.
 
+## Repository layout
+
+- `.gfxcap/scripts/` — prepare / rebrand / build / source-edit pipeline
+- `.gfxcap/src/scripts/` — `gfxcli.py` (the analysis CLI) and its design doc
+- `.gfxcap/skills/` — skill descriptions
+- `.gfxcap/3rdparty/` — vendored third-party plugins and dependencies
+- `.github/workflows/` — CI build pipeline
+- everything else — upstream RenderDoc tree
