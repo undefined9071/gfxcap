@@ -48,3 +48,10 @@ qrenderdoc/3rdparty/pyside
 .DS_Store
 plugins-*/
 __pycache__
+
+# gfxcap: bundled HLSL decompiler binaries must be tracked despite the
+# global *.exe/*.dll ignores above -- they ship inside the release zip
+# (plugins/hlsl-decompiler/) and both gfxcli dump and the GUI's HLSL
+# view depend on them at runtime.
+!.gfxcap/3rdparty/hlsl-decompiler/*.exe
+!.gfxcap/3rdparty/hlsl-decompiler/*.dll
