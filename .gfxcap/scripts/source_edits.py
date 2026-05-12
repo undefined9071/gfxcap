@@ -268,52 +268,86 @@ void LibraryHooks::RegisterFunctionHook(const char *libraryName, const FunctionH
     },
 
     # ---------------------------------------------------------------------------
-    # Auto-register the bundled HLSL Decompiler plugin.
+    # Auto-register the bundled HLSL Decompiler plugin -- portably.
+    #
     # The plugin lives at <exe-dir>/plugins/hlsl-decompiler/HLSLDecompiler.bat
     # (workflow stages it from .gfxcap/3rdparty/hlsl-decompiler). The .bat
     # writes HLSL to stdout, so we register it as KnownShaderTool::Unknown
-    # with args="{input_file}" -- because there's no {output_file} placeholder,
-    # ShaderProcessingTool::RunTool falls into its stdout-as-output path.
-    # Three entries (DXBC / DXIL / SPIR-V inputs) so the GUI can decompile
-    # any shader format the capture exposes.
+    # with args="{input_file}" -- because there's no {output_file}
+    # placeholder, ShaderProcessingTool::RunTool falls into its
+    # stdout-as-output path. Three entries (DXBC / DXIL / SPIR-V inputs)
+    # so the GUI can decompile any shader format the capture exposes.
+    #
+    # PORTABILITY: the bundle must work no matter where the user extracts
+    # it. PersistantConfig (~/AppData/...) is shared across all gfxcap
+    # installs on the machine, so naively pushing an absolute path means
+    # the first install wins and every other install reuses the dead path.
+    # The fix is to re-anchor on every Load(): purge any prior
+    # gfxcap-managed entries (identified by name prefix), then re-add at
+    # the current bundle's plugin dir. This makes:
+    #   - moving / renaming the install folder just work
+    #   - swapping between multiple gfxcap installs just work
+    #   - the persisted config never carry a stale absolute path
+    # User-added tools are untouched because they don't have our prefix.
     # ---------------------------------------------------------------------------
     {
-        "desc": "PersistantConfig: auto-register bundled HLSL Decompiler",
+        "desc": "PersistantConfig: portable auto-register of bundled HLSL Decompiler",
         "file": "gfxcapui/Code/Interface/PersistantConfig.cpp",
         "find": "  // sanitisation pass, if a tool is declared as a known type ensure its inputs/outputs are correct.",
-        "replace": '''  // gfxcap: auto-register the bundled HLSL Decompiler plugin if present.
+        "replace": '''  // gfxcap: auto-register / re-anchor the bundled HLSL Decompiler plugin.
+  // Path is recomputed every Load() so the bundle is portable -- moving
+  // the install folder, renaming it, or installing a new version under a
+  // different folder name all just work.
   {
     QString hlslDecompPath = QDir(QApplication::applicationDirPath())
         .absoluteFilePath(lit("plugins/hlsl-decompiler/HLSLDecompiler.bat"));
-    if(QFileInfo(hlslDecompPath).exists())
+    bool bundlePresent = QFileInfo(hlslDecompPath).exists();
+
+    // Prune ANY prior auto-registered HLSL Decompiler entry, regardless
+    // of which bundle version added it. Three matching rules covers the
+    // history:
+    //   1. our new entries carry a "gfxcap:" name prefix
+    //   2. pre-prefix entries (v1.0.0 .. v1.2.0) used names like
+    //      "HLSL Decompiler (DXBC)" / "(DXIL)" / "(SPIR-V)"
+    //   3. any entry whose executable path resolves to a
+    //      `plugins/hlsl-decompiler/HLSLDecompiler.bat` is one of ours,
+    //      no matter what name the user gave it
+    // User-added tools that don't match any of these are untouched.
+    for(int32_t i = (int32_t)ShaderProcessors.count() - 1; i >= 0; i--)
     {
-      bool already = false;
-      for(const ShaderProcessingTool &t : ShaderProcessors)
+      const QString nm = QString(ShaderProcessors[i].name);
+      // Normalize path separators so both `/plugins/...` and
+      // `\\plugins\\...` forms match the same suffix check below.
+      QString exeNorm = QString(ShaderProcessors[i].executable)
+                          .replace(QChar('\\\\'), QChar('/'));
+      bool ours = nm.startsWith(lit("gfxcap:")) ||
+                  nm == lit("HLSL Decompiler (DXBC)") ||
+                  nm == lit("HLSL Decompiler (DXIL)") ||
+                  nm == lit("HLSL Decompiler (SPIR-V)") ||
+                  exeNorm.endsWith(
+                    lit("/plugins/hlsl-decompiler/HLSLDecompiler.bat"),
+                    Qt::CaseInsensitive);
+      if(ours)
+        ShaderProcessors.erase(i);
+    }
+
+    if(bundlePresent)
+    {
+      struct { ShaderEncoding in; const char *name; } variants[] = {
+        { ShaderEncoding::DXBC,  "gfxcap: HLSL Decompiler (DXBC)"   },
+        { ShaderEncoding::DXIL,  "gfxcap: HLSL Decompiler (DXIL)"   },
+        { ShaderEncoding::SPIRV, "gfxcap: HLSL Decompiler (SPIR-V)" },
+      };
+      for(const auto &v : variants)
       {
-        if(QString(t.executable) == hlslDecompPath)
-        {
-          already = true;
-          break;
-        }
-      }
-      if(!already)
-      {
-        struct { ShaderEncoding in; const char *name; } variants[] = {
-          { ShaderEncoding::DXBC,  "HLSL Decompiler (DXBC)"  },
-          { ShaderEncoding::DXIL,  "HLSL Decompiler (DXIL)"  },
-          { ShaderEncoding::SPIRV, "HLSL Decompiler (SPIR-V)" },
-        };
-        for(const auto &v : variants)
-        {
-          ShaderProcessingTool s;
-          s.tool = KnownShaderTool::Unknown;
-          s.name = v.name;
-          s.executable = hlslDecompPath;
-          s.args = "{input_file}";
-          s.input = v.in;
-          s.output = ShaderEncoding::HLSL;
-          ShaderProcessors.push_back(s);
-        }
+        ShaderProcessingTool s;
+        s.tool = KnownShaderTool::Unknown;
+        s.name = v.name;
+        s.executable = hlslDecompPath;
+        s.args = "{input_file}";
+        s.input = v.in;
+        s.output = ShaderEncoding::HLSL;
+        ShaderProcessors.push_back(s);
       }
     }
   }

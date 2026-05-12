@@ -26,6 +26,16 @@ Design principles (see DESIGN.md):
     - README.md carries metadata, draw call args, coverage, navigation,
       and the full error list -- one entry-point file the LLM reads
       first
+    - **portability is load-bearing**: the bundle must work no matter
+      where it's extracted, moved, or renamed. We must never:
+        * persist absolute paths to disk (no config / cache file)
+        * bake the bundle location into output that survives the run
+        * depend on the user's cwd for resolving bundle-internal paths
+      All bundle-internal paths are derived from `__file__` at every
+      invocation so move-and-rename of the install folder is a no-op.
+      User-supplied paths (rdc, --out) are resolved to absolute at
+      entry so subprocess calls and persisted metadata don't rot if
+      the user changes cwd mid-run.
 
 Usage (from the bundle root, with the embed):
     analysis\\python36\\python.exe analysis\\gfxcli.py dump \\
@@ -119,6 +129,15 @@ def _check_rdc(rdc):
     if not rdc.exists():
         print("error: capture not found: {}".format(rdc), file=sys.stderr)
         sys.exit(2)
+
+
+def _normalize_args_paths(args):
+    """Resolve user-supplied paths (rdc, out) to absolute at the entry
+    point so subprocess calls (HLSLDecompiler), persisted metadata, and
+    any cwd changes mid-run all see a stable path."""
+    args.rdc = Path(os.path.abspath(str(args.rdc)))
+    if args.out is not None:
+        args.out = Path(os.path.abspath(str(args.out)))
 
 
 def _ts(p):
@@ -2162,6 +2181,7 @@ def _write_readme(out, rdc, controller, action, eid, counts, errors, bound_stage
 # ===========================================================================
 
 def cmd_dump(args):
+    _normalize_args_paths(args)
     _check_rdc(args.rdc)
     out = args.out if args.out is not None else _default_out(args.rdc, args.eid)
 
@@ -3043,6 +3063,7 @@ def _write_index_readme(out_dir, records, rdc, controller, shader_catalog,
 # ---------- cmd_list orchestration -----------------------------------------
 
 def cmd_list(args):
+    _normalize_args_paths(args)
     _check_rdc(args.rdc)
     out = args.out if args.out is not None else (
         args.rdc.parent / "{}_index".format(args.rdc.stem))
