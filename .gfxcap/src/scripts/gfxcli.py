@@ -11,7 +11,10 @@ Python 3.6 that gfxcap.pyd was built against.
 
 Verbs:
     dump   export a single EID's full pipeline state for AI use
-    list   (planned) enumerate events / actions in a capture
+    list   walk every event into a grep-friendly TSV index + Markdown
+           views so an LLM can find the EID it wants by shader name,
+           keyword variant, render target, marker scope, or bind-set
+           cluster
 
 Design principles (see DESIGN.md):
     - information density and reliability are top priority; disk and
@@ -31,6 +34,7 @@ Usage (from the bundle root, with the embed):
 """
 import argparse
 import datetime
+import hashlib
 import os
 import shutil
 import subprocess
@@ -2303,12 +2307,842 @@ def cmd_dump(args):
 
 
 # ===========================================================================
-# verb: list (planned)
+# verb: list  -- index every event in a capture so an LLM (or a human with
+# grep) can find an EID without opening the GUI. Authoritative output is
+# events.tsv; everything else is convenience structure built around it.
 # ===========================================================================
 
+# ActionFlags bitmask values, mirrored from
+# renderdoc/api/replay/replay_enums.h:5093. Kept here so we don't depend
+# on the gfxcap module exposing the enum at module-level.
+_AF_CLEAR        = 0x000001
+_AF_DRAWCALL     = 0x000002
+_AF_DISPATCH     = 0x000004
+_AF_MESH         = 0x000008
+_AF_CMDLIST      = 0x000010
+_AF_SETMARKER    = 0x000020
+_AF_PUSHMARKER   = 0x000040
+_AF_POPMARKER    = 0x000080
+_AF_PRESENT      = 0x000100
+_AF_MULTI        = 0x000200
+_AF_COPY         = 0x000400
+_AF_RESOLVE      = 0x000800
+_AF_GENMIPS      = 0x001000
+_AF_PASSBOUND    = 0x002000
+_AF_DISPATCH_RAY = 0x004000
+_AF_BUILD_AS     = 0x008000
+_AF_INDEXED      = 0x010000
+_AF_INSTANCED    = 0x020000
+_AF_AUTO         = 0x040000
+_AF_INDIRECT     = 0x080000
+_AF_CLEAR_COL    = 0x100000
+_AF_CLEAR_DS     = 0x200000
+_AF_BEGINPASS    = 0x400000
+_AF_ENDPASS      = 0x800000
+
+# "Work" classes -- a single primary label per event. Marker / pass-boundary
+# / present aren't real work and are excluded from events.tsv (they live in
+# marker_path / markers.md).
+_CLASS_BITS = [
+    (_AF_DRAWCALL,     "draw"),
+    (_AF_DISPATCH,     "dispatch"),
+    (_AF_MESH,         "mesh_dispatch"),
+    (_AF_DISPATCH_RAY, "dispatch_ray"),
+    (_AF_BUILD_AS,     "build_accstruct"),
+    (_AF_CLEAR,        "clear"),
+    (_AF_COPY,         "copy"),
+    (_AF_RESOLVE,      "resolve"),
+    (_AF_GENMIPS,      "gen_mips"),
+]
+
+
+def _action_class(flags_int):
+    for bit, name in _CLASS_BITS:
+        if flags_int & bit:
+            return name
+    return "other"
+
+
+def _action_modifiers(flags_int):
+    """Comma-joined list of secondary flag names (indexed, instanced, ...).
+    Empty string when none apply."""
+    mods = []
+    if flags_int & _AF_INDEXED:   mods.append("indexed")
+    if flags_int & _AF_INSTANCED: mods.append("instanced")
+    if flags_int & _AF_INDIRECT:  mods.append("indirect")
+    if flags_int & _AF_AUTO:      mods.append("auto")
+    if flags_int & _AF_CLEAR_COL: mods.append("color")
+    if flags_int & _AF_CLEAR_DS:  mods.append("depthstencil")
+    if flags_int & _AF_PASSBOUND: mods.append("passboundary")
+    return ",".join(mods)
+
+
+# An "indexable" action is one we want as a row in events.tsv -- i.e. it
+# does GPU work. Marker pushes / pops are skipped at the row level but
+# still walked so their customName becomes the marker_path of their
+# children.
+def _is_indexable(flags_int):
+    return bool(flags_int & (
+        _AF_DRAWCALL | _AF_DISPATCH | _AF_MESH | _AF_DISPATCH_RAY |
+        _AF_BUILD_AS | _AF_CLEAR | _AF_COPY | _AF_RESOLVE | _AF_GENMIPS))
+
+
+def _walk_actions(actions, parents=None):
+    """Generator: yields (action, parents_list) for every action in the
+    tree. parents_list is the chain root->...->immediate_parent."""
+    if parents is None:
+        parents = []
+    for a in actions:
+        yield a, parents
+        children = getattr(a, "children", None)
+        if children:
+            for sub in _walk_actions(children, parents + [a]):
+                yield sub
+
+
+# ---------- per-event pipeline-state enrichment -----------------------------
+
+def _shader_names_for_pipe(pipe, res_lookup):
+    """Map of stage_short -> resource_name (str). Empty string when the
+    stage isn't bound or the resource has no name."""
+    out = {}
+    if pipe is None:
+        return out
+    for attr, short, _val, _title in STAGES:
+        sh = getattr(pipe, attr, None)
+        if sh is None:
+            continue
+        rid = getattr(sh, "resourceId", None)
+        if rid is None or _is_null_id(rid):
+            continue
+        out[short] = _resource_name(res_lookup, rid, default="")
+    return out
+
+
+def _rt_info(pipe, res_lookup):
+    """(rt0_name, rt0_size_str, rt0_format_str, n_rts, dsv_name,
+        rt_resource_ids_sorted_tuple, dsv_resource_id_or_None)."""
+    rt0_name = ""
+    rt0_size = ""
+    rt0_format = ""
+    n_rts = 0
+    dsv_name = ""
+    rt_ids = []
+    dsv_id = None
+    if pipe is None:
+        return rt0_name, rt0_size, rt0_format, n_rts, dsv_name, tuple(), dsv_id
+    om = getattr(pipe, "outputMerger", None)
+    if om is None:
+        return rt0_name, rt0_size, rt0_format, n_rts, dsv_name, tuple(), dsv_id
+    rts = getattr(om, "renderTargets", []) or []
+    for i, rt in enumerate(rts):
+        rid = getattr(rt, "resource", None)
+        if rid is None or _is_null_id(rid):
+            continue
+        n_rts += 1
+        rt_ids.append(rid)
+        if not rt0_name:
+            rt0_name = _resource_name(res_lookup, rid, default="")
+            rt0_format = _format_str(getattr(rt, "format", None))
+            tex = None  # size needs a TextureDescription lookup
+    depth = getattr(om, "depthTarget", None)
+    if depth is not None:
+        rid = getattr(depth, "resource", None)
+        if rid is not None and not _is_null_id(rid):
+            dsv_name = _resource_name(res_lookup, rid, default="")
+            dsv_id = rid
+    return rt0_name, rt0_size, rt0_format, n_rts, dsv_name, tuple(rt_ids), dsv_id
+
+
+def _rt_size_from_textures(rid, tex_lookup):
+    if rid is None or rid not in tex_lookup:
+        return ""
+    t = tex_lookup[rid]
+    w = getattr(t, "width", 0) or 0
+    h = getattr(t, "height", 0) or 0
+    d = getattr(t, "depth", 0) or 0
+    if d > 1:
+        return "{}x{}x{}".format(w, h, d)
+    return "{}x{}".format(w, h)
+
+
+def _srv_ids_for_pipe(controller, gfxcap):
+    """Cheap collection of the bound SRV resource IDs across all stages,
+    pulled from descriptor access. Used to build a per-event bind
+    fingerprint. Returns a tuple of stringified ResourceIds, sorted."""
+    try:
+        accesses = list(controller.GetDescriptorAccess())
+    except Exception:
+        return tuple()
+    ids = set()
+    for acc in accesses:
+        kind = _desc_kind(getattr(acc, "type", None))
+        if kind not in ("srv", "imagesampler", "uav"):
+            continue
+        # We need the resource id, which lives on the descriptor itself.
+        desc = _fetch_one_descriptor(controller, gfxcap, acc, sampler=False)
+        if desc is None:
+            continue
+        rid = getattr(desc, "resource", None)
+        if rid is not None and not _is_null_id(rid):
+            ids.add(str(rid))
+    return tuple(sorted(ids))
+
+
+def _bind_fingerprint(shader_names, rt0_id, srv_ids):
+    """8-hex hash so that 'same kind of draw' events cluster.
+
+    Inputs intentionally include shader names (carry Unity-style keywords)
+    and the rt0 resource id (so the same shader rendering to two different
+    targets clusters separately). SRV ids cover the input texture set."""
+    h = hashlib.sha1()
+    for k in sorted(shader_names.keys()):
+        h.update(("{}={}\n".format(k, shader_names[k])).encode("utf-8"))
+    h.update(("rt0={}\n".format(rt0_id)).encode("utf-8"))
+    for s in srv_ids:
+        h.update(("srv={}\n".format(s)).encode("utf-8"))
+    return h.hexdigest()[:8]
+
+
+def _classify_hint(class_label, modifiers, num_indices, num_instances,
+                   n_rts, has_dsv, dispatch_xyz):
+    """Cheap heuristic hints. Designed to almost-never produce false
+    positives -- when in doubt, emit nothing rather than a wrong tag."""
+    if class_label == "clear":   return "clear"
+    if class_label == "copy":    return "copy"
+    if class_label == "resolve": return "resolve"
+    if class_label == "gen_mips":return "gen_mips"
+    if class_label in ("dispatch", "mesh_dispatch", "dispatch_ray"):
+        return "compute" if n_rts == 0 else ""
+    # graphics-only hints
+    if class_label == "draw":
+        # fullscreen-coverage triangle / quad: small index count, no
+        # depth read/write, one instance. Very common in post-processing.
+        if (num_instances <= 1 and num_indices in (3, 4, 6) and
+                not has_dsv):
+            return "fullscreen"
+        if num_instances >= 100:
+            return "instanced_batch"
+        if "indirect" in modifiers.split(","):
+            return "indirect"
+    return ""
+
+
+# ---------- record assembly -------------------------------------------------
+
+def _make_event_record(a, parents, controller, gfxcap, res_lookup,
+                       tex_lookup, shallow):
+    """Build the dict that becomes a single events.tsv row."""
+    flags_int = int(getattr(a, "flags", 0) or 0)
+    cls = _action_class(flags_int)
+    mods = _action_modifiers(flags_int)
+
+    api_call = ""
+    try:
+        sdf = controller.GetStructuredFile()
+        if sdf is not None and hasattr(a, "GetName"):
+            api_call = str(a.GetName(sdf))
+    except Exception:
+        pass
+
+    rec = {
+        "eid": int(getattr(a, "eventId", 0) or 0),
+        "action_id": int(getattr(a, "actionId", 0) or 0),
+        "class": cls,
+        "flags": mods,
+        "api_call": api_call,
+        "marker_path": _marker_path(parents),
+        "vs_name": "", "ps_name": "", "gs_name": "", "cs_name": "",
+        "hs_name": "", "ds_name": "",
+        "rt0_name": "", "rt0_size": "", "rt0_format": "",
+        "n_rts": 0, "dsv_name": "",
+        "num_indices":   int(getattr(a, "numIndices", 0) or 0),
+        "num_instances": int(getattr(a, "numInstances", 0) or 0),
+        "dispatch_xyz": "",
+        "indirect": "yes" if (flags_int & _AF_INDIRECT) else "",
+        "bind_fp": "",
+        "hint": "",
+        # internal-only fields (not written to TSV but used by md writers)
+        "_rt_ids": tuple(),
+        "_dsv_id": None,
+    }
+
+    # dispatch dimensions
+    dd = getattr(a, "dispatchDimension", None)
+    if dd is not None:
+        xyz = _xyz(dd)
+        if xyz not in ("?", "(0, 0, 0)"):
+            rec["dispatch_xyz"] = xyz
+
+    if shallow:
+        rec["hint"] = _classify_hint(cls, mods, rec["num_indices"],
+                                     rec["num_instances"], 0, False,
+                                     rec["dispatch_xyz"])
+        return rec
+
+    # ---- enriched: pull pipeline state for this event ----
+    try:
+        controller.SetFrameEvent(rec["eid"], True)
+    except Exception:
+        return rec
+    _api, pipe = _get_pipe(controller, ErrorCollector())  # discard errors
+    if pipe is None:
+        rec["hint"] = _classify_hint(cls, mods, rec["num_indices"],
+                                     rec["num_instances"], 0, False,
+                                     rec["dispatch_xyz"])
+        return rec
+
+    snames = _shader_names_for_pipe(pipe, res_lookup)
+    rec["vs_name"] = snames.get("vertex_shader", "")
+    rec["ps_name"] = snames.get("pixel_shader", "")
+    rec["gs_name"] = snames.get("geometry_shader", "")
+    rec["cs_name"] = snames.get("compute_shader", "")
+    rec["hs_name"] = snames.get("hull_shader", "")
+    rec["ds_name"] = snames.get("domain_shader", "")
+
+    rt0_name, rt0_size, rt0_format, n_rts, dsv_name, rt_ids, dsv_id = (
+        _rt_info(pipe, res_lookup))
+    # fill RT size from the texture description -- _rt_info doesn't have
+    # access to tex_lookup
+    if rt_ids:
+        rt0_size = _rt_size_from_textures(rt_ids[0], tex_lookup)
+    rec["rt0_name"]   = rt0_name
+    rec["rt0_size"]   = rt0_size
+    rec["rt0_format"] = rt0_format
+    rec["n_rts"]      = n_rts
+    rec["dsv_name"]   = dsv_name
+    rec["_rt_ids"]    = rt_ids
+    rec["_dsv_id"]    = dsv_id
+
+    srv_ids = _srv_ids_for_pipe(controller, gfxcap)
+    rt0_id = rt_ids[0] if rt_ids else None
+    rec["bind_fp"] = _bind_fingerprint(snames, rt0_id, srv_ids)
+
+    rec["hint"] = _classify_hint(cls, mods, rec["num_indices"],
+                                 rec["num_instances"], n_rts,
+                                 bool(dsv_id), rec["dispatch_xyz"])
+    return rec
+
+
+# ---------- TSV / Markdown writers ------------------------------------------
+
+_EVENTS_TSV_COLUMNS = [
+    "eid", "action_id", "class", "flags", "api_call", "marker_path",
+    "vs_name", "ps_name", "gs_name", "cs_name", "hs_name", "ds_name",
+    "rt0_name", "rt0_size", "rt0_format", "n_rts", "dsv_name",
+    "num_indices", "num_instances", "dispatch_xyz", "indirect",
+    "bind_fp", "hint",
+]
+
+
+def _tsv_escape(v):
+    """Strip characters that would break a TSV row (tab/newline/CR)."""
+    s = str(v) if v is not None else ""
+    return s.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+
+
+def _write_events_tsv(out_dir, records):
+    path = out_dir / "events.tsv"
+    with path.open("w", encoding="utf-8") as fp:
+        fp.write("\t".join(_EVENTS_TSV_COLUMNS) + "\n")
+        for r in records:
+            row = [_tsv_escape(r.get(c, "")) for c in _EVENTS_TSV_COLUMNS]
+            fp.write("\t".join(row) + "\n")
+    return path
+
+
+def _write_shaders_tsv(out_dir, records):
+    """Unique-shader catalogue, one row per (stage, shader_name) pair."""
+    catalog = {}
+    for r in records:
+        for stage in ("vs", "ps", "cs", "gs", "hs", "ds"):
+            name = r.get(stage + "_name", "")
+            if not name:
+                continue
+            key = (stage, name)
+            entry = catalog.setdefault(key, {"first_eid": r["eid"], "n": 0})
+            entry["n"] += 1
+            if r["eid"] < entry["first_eid"]:
+                entry["first_eid"] = r["eid"]
+    rows = sorted(
+        ((stage, name, v["first_eid"], v["n"]) for (stage, name), v
+         in catalog.items()),
+        key=lambda t: (-t[3], t[2], t[0], t[1]))
+    path = out_dir / "shaders.tsv"
+    with path.open("w", encoding="utf-8") as fp:
+        fp.write("stage\tshader_name\tfirst_eid\tn_uses\n")
+        for stage, name, first_eid, n in rows:
+            fp.write("{}\t{}\t{}\t{}\n".format(
+                stage, _tsv_escape(name), first_eid, n))
+    return path, catalog
+
+
+def _write_render_targets_md(out_dir, records, res_lookup, tex_lookup):
+    """Per-render-target lifecycle: which EIDs wrote to it, plus the
+    DSV side. Built only from enriched-mode data (skips silently in
+    shallow mode)."""
+    rt_to_eids = {}
+    rt_meta = {}
+    dsv_to_eids = {}
+    dsv_meta = {}
+    for r in records:
+        for rid in r.get("_rt_ids", ()):
+            rt_to_eids.setdefault(rid, []).append(r["eid"])
+            if rid not in rt_meta:
+                rt_meta[rid] = {
+                    "name": _resource_name(res_lookup, rid, default="(unnamed)"),
+                    "size": _rt_size_from_textures(rid, tex_lookup),
+                }
+        did = r.get("_dsv_id")
+        if did is not None:
+            dsv_to_eids.setdefault(did, []).append(r["eid"])
+            if did not in dsv_meta:
+                dsv_meta[did] = {
+                    "name": _resource_name(res_lookup, did, default="(unnamed)"),
+                    "size": _rt_size_from_textures(did, tex_lookup),
+                }
+
+    lines = [
+        "# render target lifecycles",
+        "",
+        "Every render target / depth-stencil view that was bound for "
+        "writing in this capture, with the full EID list for each. Use this "
+        "when you know *what* a draw renders into ('the main HDR buffer', "
+        "'the shadow map') but not *which EID*. The first / last EID per RT "
+        "usually maps to a `Clear` and the last write of the pass.",
+        "",
+    ]
+    if not rt_to_eids and not dsv_to_eids:
+        lines.append("(shallow mode -- no per-event RT data was collected. "
+                     "Re-run without `--shallow` to populate this file.)")
+        lines.append("")
+        _write_md(out_dir / "render_targets.md", lines)
+        return
+
+    def _summarize_eids(eids):
+        eids = sorted(eids)
+        if len(eids) <= 8:
+            return ", ".join(str(e) for e in eids)
+        return "{}, {}, {}, ... [{} more] ..., {}, {}, {}".format(
+            eids[0], eids[1], eids[2],
+            len(eids) - 6,
+            eids[-3], eids[-2], eids[-1])
+
+    if rt_to_eids:
+        lines.append("## render targets ({} unique)".format(len(rt_to_eids)))
+        lines.append("")
+        lines.append("| resource_id | name | size | n_writes | first_eid | last_eid | eids (preview) |")
+        lines.append("|-------------|------|------|----------|-----------|----------|----------------|")
+        for rid, eids in sorted(rt_to_eids.items(), key=lambda kv: -len(kv[1])):
+            meta = rt_meta[rid]
+            es = sorted(eids)
+            lines.append("| `{}` | `{}` | {} | {} | {} | {} | {} |".format(
+                rid, meta["name"], meta["size"] or "?", len(es),
+                es[0], es[-1], _summarize_eids(es)))
+        lines.append("")
+
+    if dsv_to_eids:
+        lines.append("## depth-stencil views ({} unique)".format(len(dsv_to_eids)))
+        lines.append("")
+        lines.append("| resource_id | name | size | n_writes | first_eid | last_eid | eids (preview) |")
+        lines.append("|-------------|------|------|----------|-----------|----------|----------------|")
+        for rid, eids in sorted(dsv_to_eids.items(), key=lambda kv: -len(kv[1])):
+            meta = dsv_meta[rid]
+            es = sorted(eids)
+            lines.append("| `{}` | `{}` | {} | {} | {} | {} | {} |".format(
+                rid, meta["name"], meta["size"] or "?", len(es),
+                es[0], es[-1], _summarize_eids(es)))
+        lines.append("")
+
+    _write_md(out_dir / "render_targets.md", lines)
+
+
+def _write_markers_md(out_dir, all_actions_with_parents):
+    """Marker tree: each push-marker action becomes a nested heading; its
+    EID range and immediate child events are listed under it.
+
+    `all_actions_with_parents` is the full walk -- includes markers and
+    drawables both, in source order."""
+    lines = [
+        "# marker tree",
+        "",
+        "User-inserted debug markers (PushMarker / vkCmdBeginDebugUtilsLabel) "
+        "and their EID ranges. Engines like Unity / Unreal use these to "
+        "delimit passes -- a name like `Opaque/GBuffer` here gets a row in "
+        "events.tsv's `marker_path` column for every draw inside it. "
+        "Use this file to scope your grep to one rendering pass.",
+        "",
+    ]
+    # collect: marker_action -> (depth, first_eid, last_eid, n_children_indexable)
+    markers = []  # list of (depth, customName, first_eid, last_eid, n_indexable)
+    for a, parents in all_actions_with_parents:
+        flags = int(getattr(a, "flags", 0) or 0)
+        if not (flags & _AF_PUSHMARKER):
+            continue
+        cn = getattr(a, "customName", "") or ""
+        # depth = number of ancestor PushMarkers
+        depth = sum(1 for p in parents
+                    if int(getattr(p, "flags", 0) or 0) & _AF_PUSHMARKER)
+        # walk the subtree to find first/last EID + indexable count
+        first_eid = None
+        last_eid = None
+        n_idx = 0
+        for sub, _sp in _walk_actions(getattr(a, "children", []) or []):
+            sf = int(getattr(sub, "flags", 0) or 0)
+            if _is_indexable(sf):
+                e = int(getattr(sub, "eventId", 0) or 0)
+                if first_eid is None or e < first_eid:
+                    first_eid = e
+                if last_eid is None or e > last_eid:
+                    last_eid = e
+                n_idx += 1
+        markers.append((depth, cn, first_eid, last_eid, n_idx))
+
+    if not markers:
+        lines.append("(this capture has no debug markers)")
+        lines.append("")
+    else:
+        for depth, cn, f, l, n in markers:
+            heading = "#" * min(6, 2 + depth)
+            range_str = ("eids {}-{}".format(f, l) if f is not None
+                         else "no indexable children")
+            lines.append("{} `{}` -- {} ({} indexable events)".format(
+                heading, cn, range_str, n))
+            lines.append("")
+
+    _write_md(out_dir / "markers.md", lines)
+
+
+def _write_events_md(out_dir, records, all_actions_with_parents):
+    """Hierarchical view of events keyed by marker_path. Same data as
+    events.tsv but organized for a human-style read."""
+    by_path = {}
+    for r in records:
+        by_path.setdefault(r["marker_path"], []).append(r)
+
+    lines = [
+        "# events grouped by marker_path",
+        "",
+        "Same data as events.tsv but bucketed by `marker_path` so you can "
+        "skim the pass structure visually. For `grep`-style lookup use "
+        "events.tsv instead.",
+        "",
+    ]
+    # stable order: preserve the order paths first appeared in the records
+    seen = []
+    for r in records:
+        if r["marker_path"] not in seen:
+            seen.append(r["marker_path"])
+    for path in seen:
+        rs = by_path[path]
+        title = path if path else "(no marker)"
+        lines.append("## `{}` ({} events)".format(title, len(rs)))
+        lines.append("")
+        for r in rs[:64]:
+            extra = []
+            if r["vs_name"] or r["ps_name"] or r["cs_name"]:
+                names = " / ".join(n for n in
+                                   [r["vs_name"], r["ps_name"], r["cs_name"]]
+                                   if n)
+                extra.append("`{}`".format(names))
+            if r["rt0_name"]:
+                extra.append("-> `{}`".format(r["rt0_name"]))
+            if r["hint"]:
+                extra.append("[{}]".format(r["hint"]))
+            lines.append("- eid {} ({}{}) {} {}".format(
+                r["eid"],
+                r["class"],
+                "/" + r["flags"] if r["flags"] else "",
+                r["api_call"],
+                " ".join(extra)))
+        if len(rs) > 64:
+            lines.append("- _... {} more events in this scope; see events.tsv ..._".format(
+                len(rs) - 64))
+        lines.append("")
+    _write_md(out_dir / "events.md", lines)
+
+
+def _write_index_readme(out_dir, records, rdc, controller, shader_catalog,
+                         tsv_path, shallow):
+    api = _api_name(controller)
+    try:
+        finfo = controller.GetFrameInfo()
+        frame_num = getattr(finfo, "frameNumber", "?")
+    except Exception:
+        frame_num = "?"
+
+    # class breakdown
+    class_counts = {}
+    for r in records:
+        class_counts[r["class"]] = class_counts.get(r["class"], 0) + 1
+
+    # marker paths sorted by event count
+    marker_counts = {}
+    for r in records:
+        marker_counts[r["marker_path"]] = marker_counts.get(r["marker_path"], 0) + 1
+
+    # top shaders
+    top_shaders = sorted(
+        ((stage, name, v["first_eid"], v["n"])
+         for (stage, name), v in (shader_catalog or {}).items()),
+        key=lambda t: (-t[3], t[2]))[:10]
+
+    lines = [
+        "# gfxcli list -- event index",
+        "",
+        "Capture: `{}` ({} mode)".format(rdc, "shallow" if shallow else "enriched"),
+        "",
+        "- api: {}".format(api),
+        "- frame: {}".format(frame_num),
+        "- indexable events: {}".format(len(records)),
+        "",
+        "## how to use this index",
+        "",
+        "The authoritative artifact is **`events.tsv`** -- one row per "
+        "drawable event with grep-friendly columns. The `.md` files are "
+        "convenience views built from the same data.",
+        "",
+        "1. Skim `## frame breakdown` and `## top shaders` below to "
+        "understand what's in the capture.",
+        "2. Pick one of the **grep recipes** below to narrow events.tsv "
+        "down to a handful of EIDs.",
+        "3. `gfxcli dump -r CAPTURE -e <eid>` on a candidate to inspect "
+        "pipeline state + textures + cbuffers in detail.",
+        "",
+        "## events.tsv schema",
+        "",
+        "Tab-separated, first row is a header. Columns:",
+        "",
+        "| column | meaning |",
+        "|--------|---------|",
+        "| eid | event id -- pass to `gfxcli dump -e` |",
+        "| action_id | sequential action id within the frame |",
+        "| class | draw / dispatch / mesh_dispatch / dispatch_ray / clear / copy / resolve / gen_mips / other |",
+        "| flags | secondary modifiers: indexed,instanced,indirect,auto,color,depthstencil,passboundary |",
+        "| api_call | API method name (e.g. `ID3D11DeviceContext::DrawIndexedInstanced`) |",
+        "| marker_path | push-marker chain `A > B > C` |",
+        "| vs_name, ps_name, gs_name, cs_name, hs_name, ds_name | engine-side shader name per stage; carries Unity / Unreal keyword variants when the engine encodes them in the resource name |",
+        "| rt0_name | first bound render target's engine name |",
+        "| rt0_size | first RT WxH (or WxHxD for 3D) |",
+        "| rt0_format | first RT format string |",
+        "| n_rts | total bound RTs |",
+        "| dsv_name | depth-stencil view engine name |",
+        "| num_indices / num_instances / dispatch_xyz | draw/dispatch counts |",
+        "| indirect | `yes` if indirect call |",
+        "| bind_fp | 8-hex hash of (shader names + rt0 + sorted SRV ids); same bind_fp == same kind of draw |",
+        "| hint | cheap heuristic tag: fullscreen / instanced_batch / compute / clear / copy / indirect |",
+        "",
+        "## frame breakdown",
+        "",
+        "| class | count |",
+        "|-------|-------|",
+    ]
+    for cls in ("draw", "dispatch", "mesh_dispatch", "dispatch_ray",
+                "build_accstruct", "clear", "copy", "resolve", "gen_mips",
+                "other"):
+        c = class_counts.get(cls, 0)
+        if c:
+            lines.append("| {} | {} |".format(cls, c))
+    lines.append("")
+
+    if top_shaders:
+        lines.append("## top shaders (by use count)")
+        lines.append("")
+        lines.append("| n_uses | stage | first_eid | shader_name |")
+        lines.append("|--------|-------|-----------|-------------|")
+        for stage, name, first_eid, n in top_shaders:
+            disp_name = name.replace("|", "\\|")
+            lines.append("| {} | {} | {} | `{}` |".format(
+                n, stage, first_eid, disp_name))
+        lines.append("")
+
+    # top marker scopes
+    if any(p for p in marker_counts):
+        top_markers = sorted(
+            ((p, c) for p, c in marker_counts.items() if p),
+            key=lambda t: -t[1])[:10]
+        if top_markers:
+            lines.append("## top marker scopes (by event count)")
+            lines.append("")
+            lines.append("| n_events | marker_path |")
+            lines.append("|----------|-------------|")
+            for p, c in top_markers:
+                lines.append("| {} | `{}` |".format(c, p))
+            lines.append("")
+
+    lines.extend([
+        "## grep recipes",
+        "",
+        "These run against `events.tsv`. Replace `EVENTS` with the path.",
+        "",
+        "**By shader name / Unity keyword variant** (most common entry "
+        "point for engine reverse-engineering):",
+        "",
+        "```sh",
+        "# all draws using the HG_ENABLE_MV variant of HGRP/Lit",
+        "grep -F 'HG_ENABLE_MV' EVENTS | awk -F'\\t' '$3==\"draw\"'",
+        "",
+        "# every event hitting any *Shadow* shader",
+        "grep -i shadow EVENTS",
+        "```",
+        "",
+        "**By marker / pass**:",
+        "",
+        "```sh",
+        "# draws inside the GBuffer pass",
+        "grep -P '\\tGBuffer' EVENTS",
+        "",
+        "# everything under a specific marker subtree",
+        "grep -F 'Opaque > GBuffer' EVENTS",
+        "```",
+        "",
+        "**By render target** (see also render_targets.md):",
+        "",
+        "```sh",
+        "# all draws into render target named MainHDR",
+        "awk -F'\\t' '$13 ~ /MainHDR/' EVENTS",
+        "```",
+        "",
+        "**By draw class / modifier**:",
+        "",
+        "```sh",
+        "# only compute dispatches",
+        "awk -F'\\t' '$3==\"dispatch\"' EVENTS",
+        "",
+        "# instanced draws",
+        "grep -P '\\tinstanced' EVENTS",
+        "```",
+        "",
+        "**Cluster: find one representative per bind-fingerprint** "
+        "(deduplicates 'same kind of draw'):",
+        "",
+        "```sh",
+        "# print first eid for each unique bind_fp",
+        "awk -F'\\t' 'NR>1 && !seen[$22]++ {print $1, $22, $7, $13}' EVENTS",
+        "```",
+        "",
+        "**Find fullscreen / post-process candidates**:",
+        "",
+        "```sh",
+        "awk -F'\\t' '$23==\"fullscreen\"' EVENTS",
+        "```",
+        "",
+        "## files",
+        "",
+        "- `events.tsv` -- main grep target",
+        "- `events.md` -- same data grouped by marker_path",
+        "- `shaders.tsv` -- unique shader catalogue (use to pick a "
+        "representative EID for each shader)",
+        "- `render_targets.md` -- per-RT EID lifecycle",
+        "- `markers.md` -- marker tree with EID ranges per scope",
+        "",
+    ])
+    _write_md(out_dir / "README.md", lines)
+
+
+# ---------- cmd_list orchestration -----------------------------------------
+
 def cmd_list(args):
-    print("error: 'list' is not implemented yet", file=sys.stderr)
-    return 64
+    _check_rdc(args.rdc)
+    out = args.out if args.out is not None else (
+        args.rdc.parent / "{}_index".format(args.rdc.stem))
+    if out.exists() and args.out is None:
+        try:
+            shutil.rmtree(str(out))
+        except OSError:
+            pass
+    out.mkdir(parents=True, exist_ok=True)
+
+    bundle_root = _bootstrap_gfxcap_module()  # noqa: F841 -- side effects only
+    gfxcap = _import_gfxcap()
+
+    quiet = getattr(args, "quiet", False)
+    if not quiet:
+        print("[gfxcli] mode: {}".format("shallow" if args.shallow else "enriched"))
+        print("[gfxcli] rdc:  {}".format(args.rdc))
+        print("[gfxcli] out:  {}".format(out))
+
+    try:
+        capfile, controller = _open_capture(gfxcap, args.rdc)
+    except Exception as e:
+        print("fatal: cannot open capture: {}".format(e), file=sys.stderr)
+        return 2
+
+    try:
+        roots = controller.GetRootActions()
+    except Exception as e:
+        print("fatal: GetRootActions failed: {}".format(e), file=sys.stderr)
+        return 3
+
+    res_lookup = _resource_lookup(controller)
+    tex_lookup = _texture_lookup(controller)
+
+    # First pass: full walk so we can index markers + provide accurate
+    # marker_path for every drawable.
+    all_walk = list(_walk_actions(roots))
+    indexable = [(a, parents) for a, parents in all_walk
+                 if _is_indexable(int(getattr(a, "flags", 0) or 0))]
+
+    # Apply filter flags
+    filter_classes = None
+    if args.filter_flags:
+        filter_classes = set(x.strip() for x in args.filter_flags.split(",")
+                             if x.strip())
+    marker_prefix = (args.marker_prefix or "").strip()
+
+    def _keep(a, parents):
+        flags = int(getattr(a, "flags", 0) or 0)
+        cls = _action_class(flags)
+        if args.skip_clears and cls == "clear":
+            return False
+        if args.skip_copies and cls in ("copy", "resolve"):
+            return False
+        if filter_classes and cls not in filter_classes:
+            return False
+        if marker_prefix:
+            mp = _marker_path(parents)
+            if not mp.startswith(marker_prefix):
+                return False
+        return True
+
+    todo = [(a, p) for a, p in indexable if _keep(a, p)]
+    total = len(todo)
+
+    if not quiet:
+        print("[gfxcli] {} indexable events in capture; {} after filters"
+              .format(len(indexable), total))
+
+    records = []
+    next_progress = 100
+    for i, (a, parents) in enumerate(todo):
+        rec = _make_event_record(a, parents, controller, gfxcap, res_lookup,
+                                  tex_lookup, args.shallow)
+        records.append(rec)
+        if not quiet and (i + 1) >= next_progress:
+            print("[gfxcli] progress: {}/{} events".format(i + 1, total))
+            sys.stdout.flush()
+            next_progress = (i + 1) + 100
+
+    tsv_path = _write_events_tsv(out, records)
+    _shaders_path, shader_catalog = _write_shaders_tsv(out, records)
+    _write_render_targets_md(out, records, res_lookup, tex_lookup)
+    _write_markers_md(out, all_walk)
+    _write_events_md(out, records, all_walk)
+    _write_index_readme(out, records, args.rdc, controller, shader_catalog,
+                        tsv_path, args.shallow)
+
+    try:
+        controller.Shutdown()
+    except Exception:
+        pass
+    try:
+        capfile.Shutdown()
+    except Exception:
+        pass
+
+    if not quiet:
+        print("[gfxcli] index written to: {}".format(out))
+    return 0
 
 
 # ===========================================================================
@@ -2343,9 +3177,35 @@ def _build_parser():
 
     p_list = sub.add_parser(
         "list",
-        help="(planned) enumerate events in a capture",
+        help="enumerate every event in a capture into a grep-friendly TSV "
+             "+ Markdown index",
+        description="Walk every action in a capture and write a per-event "
+                    "TSV (events.tsv), plus convenience indexes "
+                    "(events.md, shaders.tsv, render_targets.md, "
+                    "markers.md, README.md) for LLM-friendly browsing.",
     )
-    p_list.add_argument("-r", "--rdc", required=True, type=Path)
+    p_list.add_argument("-r", "--rdc", required=True, type=Path,
+                        help="path to the .rdc / .gcap capture file")
+    p_list.add_argument("--out", type=Path, default=None,
+                        help="output dir (default: <rdc-dir>/<rdc-stem>_index/)")
+    p_list.add_argument("--shallow", action="store_true",
+                        help="skip per-event pipeline state queries -- "
+                             "leaves shader / RT / fingerprint columns blank "
+                             "but runs in seconds even on huge captures.")
+    p_list.add_argument("--filter-flags", default=None,
+                        help="comma-list of class labels to keep: "
+                             "draw,dispatch,mesh_dispatch,dispatch_ray,"
+                             "build_accstruct,clear,copy,resolve,gen_mips. "
+                             "Default: keep all.")
+    p_list.add_argument("--marker-prefix", default=None,
+                        help="only keep events whose marker_path startswith "
+                             "this substring (e.g. `Frame > Opaque`).")
+    p_list.add_argument("--skip-clears", action="store_true",
+                        help="drop class=clear events from the index")
+    p_list.add_argument("--skip-copies", action="store_true",
+                        help="drop class=copy and class=resolve events")
+    p_list.add_argument("--quiet", action="store_true",
+                        help="suppress progress lines")
     p_list.set_defaults(func=cmd_list)
 
     return p

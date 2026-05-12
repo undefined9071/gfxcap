@@ -28,18 +28,29 @@ Subcommand-driven so future verbs can land without breaking v1 callers.
 
 ```
 gfxcli dump  -r <capture>  -e <eid>  [--out DIR] [--quiet]
-gfxcli list  -r <capture>                                       (planned)
+gfxcli list  -r <capture>            [--out DIR] [--shallow]
+                                     [--filter-flags LIST]
+                                     [--marker-prefix STR]
+                                     [--skip-clears] [--skip-copies]
+                                     [--quiet]
 ```
+
+The intended workflow is `list` → grep / awk on the resulting TSV →
+`dump` on the chosen EID. `list` is heavy enough that callers should
+run it once per capture and cache the index; `dump` is the per-event
+deep dive.
 
 All flags are explicit (no positional args). Short forms: `-r` for
 `--rdc`, `-e` for `--eid`.
 
-`--out` defaults to `<rdc-dir>/<rdc-stem>_eid<eid>/` (sibling of the
-capture file, NOT cwd). The capture is the obvious anchor and we want
-the output co-located so it does not accumulate in random working
-directories. When `--out` is left at its default, the directory is
-wiped before each dump so stale files from prior runs cannot mix with
-current output. User-supplied `--out` is left alone.
+`dump --out` defaults to `<rdc-dir>/<rdc-stem>_eid<eid>/`;
+`list --out` defaults to `<rdc-dir>/<rdc-stem>_index/`. Both are
+siblings of the capture file (NOT cwd); the capture is the obvious
+anchor and we want the output co-located so it does not accumulate
+in random working directories. When `--out` is left at its default
+the directory is wiped before each run so stale files from prior
+runs cannot mix with current output. User-supplied `--out` is left
+alone.
 
 The bundle ships no `.bat` launcher. Invoke via:
 
@@ -51,6 +62,8 @@ PATH or `$env:PATH` can shorten this when needed.
 
 ### Exit codes
 
+dump:
+
 - `0` — all targets exported successfully
 - `1` — partial success: capture/EID resolved, but at least one target
   failed (caller should read `README.md`)
@@ -58,6 +71,13 @@ PATH or `$env:PATH` can shorten this when needed.
 - `3` — EID not found in the capture
 - `4` — gfxcap module load failed (Python ABI mismatch, missing DLL)
 - `64` — usage error (e.g. unimplemented verb)
+
+list:
+
+- `0` — index written
+- `2` — capture cannot be opened
+- `3` — action enumeration failed
+- `4` — gfxcap module load failed
 
 `1` is intentionally distinct from `0` so a caller can distinguish
 "clean export" from "partial export" without parsing markdown. The LLM
@@ -83,10 +103,22 @@ is bound for the action being dumped.
     shader.asm                       DXBC disassembly (always)
     shader.hlsl                      HLSL decompile (always; ERROR
                                      header on fail)
-    reflection.md                    cbuffer / SRV / sampler / UAV
-                                     declared layout
+    reflection.md                    identity (resource_name with
+                                     engine-side debug name + Unity /
+                                     Unreal keyword variants when
+                                     present) + compile flags
+                                     (@cmdline + extracted /D
+                                     defines) + cbuffer / SRV /
+                                     sampler / UAV declared layout
     io_signatures.md                 input + output register sigs
-    constant_buffer_b<n>.md          decoded values + raw bytes
+    original_source/<file>           original HLSL / GLSL embedded
+                                     in shader debug info (only when
+                                     stamped by the compiler)
+    constant_buffer_b<n>.md          decoded values (head/tail
+                                     preview when > 128 entries)
+    constant_buffer_b<n>.bin         raw constant-buffer bytes
+    constant_buffer_b<n>_vars.tsv    full variable table when
+                                     > 128 entries
     texture_t<n>.dds + .png + .md
     buffer_t<n>.bin + .md
     sampler_s<n>.md
@@ -160,6 +192,23 @@ The LLM can compare its understanding of (1) and (2) against the
 authoritative bytes in (3). If decoded values disagree with raw bytes,
 the LLM has a signal that decode went wrong.
 
+### Cbuffer granularity split
+
+Unity / Unreal globals cbuffers can carry thousands of variables. A
+single `.md` with all of them inline becomes too large for an LLM to
+read in one pass (we saw 586 KB / 8 K lines on an Endfield capture).
+The split rule:
+
+- raw bytes always go to a sibling `.bin` (never a hex dump inside
+  `.md`)
+- when variables > 128, the full table goes to a sibling `_vars.tsv`
+  and the `.md` keeps a head-32 + tail-8 preview plus a pointer
+
+The threshold (128) is informed by the observation that most cbuffers
+in shipping titles are < 50 vars; the megacbuffers (`$Globals`,
+`UnityPerFrame`) are the long-tail outliers and benefit most from
+splitting.
+
 Example:
 
 ```
@@ -189,6 +238,86 @@ Example:
 0x0000: 00 00 80 3F  00 00 00 00  00 00 00 00  00 00 00 00
 ...
 ```
+
+## Output directory layout (verb: list)
+
+```
+<out>/
+  README.md              frame breakdown + schema + grep recipes
+                         (the LLM's first read)
+  events.tsv             one row per drawable event; tab-separated.
+                         Authoritative artifact -- everything else is
+                         a convenience view of this data.
+  events.md              same data grouped by marker_path
+                         (visual skim)
+  shaders.tsv            unique-shader catalogue
+                         (stage, shader_name, first_eid, n_uses)
+  render_targets.md      per-RT lifecycle: name, size, format, every
+                         EID writing to it; per-DSV the same
+  markers.md             marker tree with EID range per scope
+```
+
+### Why TSV is the primary artifact
+
+A `list` run on a 10 K-event capture takes minutes (one
+`SetFrameEvent` per event in enriched mode). Re-running to refine a
+filter would burn that time again. With a TSV, the LLM does one read
+and then composes arbitrary filters via grep / awk pipes, including
+boolean combinations no single CLI flag could express.
+
+The Markdown views (events.md / markers.md / render_targets.md /
+README.md) are convenience layers built from the same per-event
+records — they don't carry independent state. If you only need one
+file, take events.tsv.
+
+### events.tsv schema
+
+Columns chosen to be (a) cheap to compute, (b) high-affinity for LLM
+grep-style queries, (c) stable enough that grep recipes in the
+README don't rot.
+
+```
+eid action_id class flags api_call marker_path
+vs_name ps_name gs_name cs_name hs_name ds_name
+rt0_name rt0_size rt0_format n_rts dsv_name
+num_indices num_instances dispatch_xyz indirect
+bind_fp hint
+```
+
+- `class` is the primary action label (`draw` / `dispatch` /
+  `clear` / ...), one value per row.
+- `flags` is the comma-joined set of secondary modifiers
+  (`indexed,instanced,indirect,...`).
+- `vs_name` ... `ds_name` carry the **engine-side resource name**
+  per stage. For Unity / Unreal builds this is where keyword
+  variants end up encoded, so a grep for `HG_ENABLE_MV` on the
+  shader-name columns directly returns events using that variant.
+- `bind_fp` is a 8-hex SHA1 prefix of (shader names + rt0 id +
+  sorted SRV ids). Same `bind_fp` ≈ same kind of draw.
+- `hint` is a cheap heuristic tag (`fullscreen`, `instanced_batch`,
+  `compute`, `shadow`?, ...). False positives are worse than
+  silence, so the rules are conservative.
+
+### Shallow vs enriched
+
+`--shallow` skips `SetFrameEvent` entirely. The TSV still has class,
+flags, api_call, marker_path, counts, and the cheap hints — but the
+shader / RT / fingerprint columns are blank. Use shallow on captures
+where a first-pass triage is enough or where enriched cost is
+prohibitive (>50 K events).
+
+Enriched (default) does `SetFrameEvent` once per indexable event and
+pulls bound shader / RT / SRV state via the same per-API pipe access
+helpers as `dump`. The cost is ~50–100 ms per event empirically.
+
+### Filter flags (pre-write)
+
+`--filter-flags`, `--marker-prefix`, `--skip-clears`, `--skip-copies`
+narrow the set of events the writer iterates over. They exist for
+cost reasons, not as a substitute for grep: an LLM that wants
+`draw AND (shader X) AND (NOT marker Y)` will compose that with
+grep pipes against the full TSV, not by re-running list with new
+flags.
 
 ## README.md (single entry point)
 

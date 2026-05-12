@@ -18,9 +18,10 @@ get in the way of stock RenderDoc:
 - F12 captures persist on disk under `./captures/*.rdc` next to the
   executable. They are never auto-deleted.
 - The bundled HLSL Decompiler plugin is auto-registered on first launch.
-- Single-event export CLI (`gfxcli`) produces an LLM-readable Markdown
-  bundle describing every state input the GPU saw at one draw or
-  dispatch.
+- LLM-friendly analysis CLI (`gfxcli`). `list` walks every event in a
+  capture into a grep-friendly TSV index (shader name + Unity / Unreal
+  keyword variants + render target + marker / pass). `dump` exports a
+  single EID's complete pipeline state into a Markdown bundle.
 
 ## License
 
@@ -76,31 +77,47 @@ in `./captures/*.rdc` next to the target exe.
 ## CLI: `gfxcli`
 
 `gfxcli` is shipped under `analysis/` in the portable bundle alongside an
-embedded Python 3.6 (matched to `gfxcap.pyd`'s ABI). It exports the full GPU
-pipeline state for one event into a self-contained Markdown directory:
+embedded Python 3.6 (matched to `gfxcap.pyd`'s ABI). Two verbs intended
+to be used together:
 
 ```
-analysis\python36\python.exe analysis\gfxcli.py dump --rdc <capture>.rdc --eid <event-id>
+analysis\python36\python.exe analysis\gfxcli.py list -r <capture>.rdc
+analysis\python36\python.exe analysis\gfxcli.py dump -r <capture>.rdc -e <eid>
 ```
 
-The output directory contains:
+**`list`** walks every event in the capture and writes a per-event TSV
+index (`events.tsv`) plus Markdown views. The TSV is the authoritative
+artifact — one row per drawable event with columns for shader name (with
+Unity / Unreal keyword variants encoded verbatim), render target identity
+and size, marker / pass scope, bind-fingerprint cluster, and cheap
+heuristics like `fullscreen` / `compute` / `instanced_batch`. An LLM
+greps / awks the TSV to narrow thousands of events down to a handful of
+candidate EIDs without ever opening the GUI.
 
-- per-stage shader bytecode + DXBC disassembly + decompiled HLSL
-- per-binding constant buffer values (decoded variables alongside the raw
-  bytes so an LLM can crosscheck decode against ground truth)
-- bound textures (DDS + PNG) and buffers (raw `.bin`)
+**`dump`** exports the full pipeline state for one chosen EID:
+
+- per-stage shader bytecode + DXBC disassembly + decompiled HLSL +
+  original-source files (when the compiler embedded them)
+- per-stage compile flags (`@cmdline` + `/D` defines extracted) so
+  keyword-variant context is preserved
+- per-binding constant buffer values (decoded variables alongside the
+  raw `.bin` so an LLM can crosscheck decode against ground truth)
+- bound textures (DDS + PNG) and buffers (raw `.bin`); engine-side
+  resource names surfaced on every resource
 - input assembly, output merger, rasterizer state
-- a coverage report and per-target failure log so partial failures cannot
+- marker path (`Frame > Opaque > GBuffer`) breadcrumb in the README
+- coverage report and per-target failure log so partial failures cannot
   go unnoticed
 
-See [`.gfxcap/src/scripts/DESIGN.md`](.gfxcap/src/scripts/DESIGN.md) for the
-output layout reference and the per-file Markdown templates.
+See [`.gfxcap/src/scripts/DESIGN.md`](.gfxcap/src/scripts/DESIGN.md) for
+the output layout reference, the CLI rationale, and the per-file
+Markdown templates.
 
 ## Skill (for AI agents)
 
 [`.gfxcap/skills/SKILL.md`](.gfxcap/skills/SKILL.md) is a skill description
-so an AI agent can invoke `gfxcli dump` automatically when asked to inspect
-a specific draw call from a capture.
+so an AI agent can invoke `gfxcli list` and `gfxcli dump` automatically
+when asked to find / inspect draws in a capture.
 
 ## Repository layout
 
