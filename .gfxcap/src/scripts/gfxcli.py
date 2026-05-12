@@ -133,16 +133,33 @@ def _api_name(controller):
         return "unknown"
 
 
-def _find_action(actions, eid):
+def _find_action(actions, eid, parents=None):
+    """Return (action, parents_list) where parents_list is the chain of
+    ancestor ActionDescriptions from root to the immediate parent.
+    Returns (None, []) if not found."""
+    if parents is None:
+        parents = []
     for a in actions:
         if getattr(a, "eventId", None) == eid:
-            return a
+            return a, list(parents)
         children = getattr(a, "children", None)
         if children:
-            r = _find_action(children, eid)
-            if r is not None:
-                return r
-    return None
+            found, p = _find_action(children, eid, parents + [a])
+            if found is not None:
+                return found, p
+    return None, []
+
+
+def _marker_path(parents):
+    """Build a 'Frame > Opaque > GBuffer' breadcrumb from a parents list.
+    Only ancestors with a non-empty customName contribute (those are the
+    push-marker frames)."""
+    names = []
+    for p in parents:
+        cn = getattr(p, "customName", None)
+        if cn:
+            names.append(str(cn))
+    return " > ".join(names) if names else ""
 
 
 def _action_name(action, controller):
@@ -383,9 +400,15 @@ def _decompile_hlsl(dxbc_path, hlsl_path, errors, stage_short, bundle_root):
 
     env = os.environ.copy()
     env["PATH"] = str(bat.parent) + os.pathsep + env.get("PATH", "")
+    # subprocess runs with cwd=plugin_dir; the dxbc / output paths must be
+    # absolute so they resolve correctly from that cwd. dxbc2dxil otherwise
+    # fails with "specified path not found" (ERROR_PATH_NOT_FOUND 0x80070003).
+    # os.path.abspath also tolerates not-yet-existing output paths.
+    dxbc_abs = os.path.abspath(str(dxbc_path))
+    hlsl_abs = os.path.abspath(str(hlsl_path))
     try:
         r = subprocess.run(
-            [str(bat), str(dxbc_path), "-dxbc", str(hlsl_path)],
+            [str(bat), dxbc_abs, "-dxbc", hlsl_abs],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=str(bat.parent),
@@ -435,7 +458,8 @@ def _decompile_hlsl(dxbc_path, hlsl_path, errors, stage_short, bundle_root):
 # reflection.md / io_signatures.md
 # ===========================================================================
 
-def _write_reflection_md(stage_dir, refl, errors, stage_short):
+def _write_reflection_md(stage_dir, refl, errors, stage_short,
+                          shader=None, res_lookup=None):
     target = stage_dir / "reflection.md"
     if refl is None:
         _write_failure_md(target, "{} reflection".format(STAGE_TITLE.get(stage_short, stage_short)),
@@ -445,23 +469,118 @@ def _write_reflection_md(stage_dir, refl, errors, stage_short):
 
     title = STAGE_TITLE.get(stage_short, stage_short)
     lines = ["# {} -- shader reflection".format(title), ""]
-    lines.append("Declared cbuffer / SRV / sampler / UAV layout from the "
-                 "shader's reflection metadata.")
+    lines.append("Identity, debug metadata, and declared cbuffer / SRV / "
+                 "sampler / UAV layout from the shader's reflection.")
     lines.append("")
+
+    # ---------- identity ----------
+    shader_rid = getattr(shader, "resourceId", None) if shader is not None else None
+    if shader_rid is None:
+        shader_rid = getattr(refl, "resourceId", None)
+    if res_lookup is not None and shader_rid is not None:
+        lines.append("- resource_name: `{}`".format(
+            _resource_name(res_lookup, shader_rid, default="(unnamed)")))
+    lines.append("- resource_id: `{}`".format(shader_rid))
     lines.append("- entry_point: `{}`".format(getattr(refl, "entryPoint", "?")))
     lines.append("- stage: {}".format(_enum_str(getattr(refl, "stage", "?"))))
     lines.append("- encoding: {}".format(_enum_str(getattr(refl, "encoding", "?"))))
     lines.append("- raw_bytes_size: {}".format(len(getattr(refl, "rawBytes", b"") or b"")))
+
+    # output_topology is only meaningful for hull / domain / geometry / mesh
+    # shaders. RenderDoc happily populates the field on other stages with
+    # whatever fxc/dxc dropped in there, so gate explicitly.
+    stage_name = _enum_str(getattr(refl, "stage", "?"))
+    if stage_name in ("Hull", "Domain", "Geometry", "Mesh", "Task"):
+        topo = getattr(refl, "outputTopology", None)
+        if topo is not None:
+            topo_str = _enum_str(topo)
+            if topo_str and topo_str.lower() not in ("unknown", "?"):
+                lines.append("- output_topology: {}".format(topo_str))
+
+    # dispatch_threads_dimension is the compute/mesh numthreads(x,y,z); gate
+    # on stage for the same reason.
+    if stage_name in ("Compute", "Mesh", "Task"):
+        dtd = getattr(refl, "dispatchThreadsDimension", None)
+        if dtd is not None:
+            xyz = _xyz(dtd)
+            if xyz not in ("?", "(0, 0, 0)"):
+                lines.append("- dispatch_threads_dimension: {}".format(xyz))
+
+    # ---------- debug info ----------
     dbg = getattr(refl, "debugInfo", None)
     if dbg is not None:
-        files = getattr(dbg, "files", None)
-        if files:
-            try:
-                first = files[0]
-                lines.append("- debug_first_file: `{}`".format(getattr(first, "filename", "?")))
-            except Exception:
-                pass
+        compiler = _enum_str(getattr(dbg, "compiler", "?"))
+        if compiler and compiler != "?":
+            lines.append("- compiler: {}".format(compiler))
+        esn = getattr(dbg, "entrySourceName", "")
+        if esn:
+            lines.append("- entry_source_name: `{}`".format(esn))
+        lines.append("- source_debug_information: {}".format(
+            getattr(dbg, "sourceDebugInformation", "?")))
+        lines.append("- debuggable: {}".format(getattr(dbg, "debuggable", "?")))
+        dstatus = getattr(dbg, "debugStatus", "")
+        if dstatus:
+            lines.append("- debug_status: `{}`".format(dstatus))
     lines.append("")
+
+    # ---------- compile flags / defines ----------
+    cflags = []
+    if dbg is not None:
+        cf_obj = getattr(dbg, "compileFlags", None)
+        if cf_obj is not None:
+            cflags = list(getattr(cf_obj, "flags", []) or [])
+
+    lines.append("## compile flags ({} entries)".format(len(cflags)))
+    lines.append("")
+    lines.append("Macros and command-line args the shader was compiled with. "
+                 "For Unity / Unreal builds the keyword/variant defines live "
+                 "here (look for `@cmdline` or per-keyword entries).")
+    lines.append("")
+    if cflags:
+        cmdline_value = None
+        lines.append("| name | value |")
+        lines.append("|------|-------|")
+        for f in cflags:
+            n = str(getattr(f, "name", "?"))
+            v = str(getattr(f, "value", ""))
+            if n == "@cmdline":
+                cmdline_value = v
+            v_disp = v.replace("|", "\\|").replace("\n", " ")
+            if len(v_disp) > 400:
+                v_disp = v_disp[:400] + " ... [{} chars total]".format(len(v))
+            lines.append("| `{}` | `{}` |".format(n, v_disp))
+        lines.append("")
+
+        # explode /D defines from @cmdline so they're greppable
+        if cmdline_value:
+            defines = _extract_defines(cmdline_value)
+            if defines:
+                lines.append("### /D defines extracted from `@cmdline`")
+                lines.append("")
+                lines.append("| define | value |")
+                lines.append("|--------|-------|")
+                for k, vv in defines:
+                    lines.append("| `{}` | `{}` |".format(k, vv))
+                lines.append("")
+
+    # ---------- source files ----------
+    files = []
+    if dbg is not None:
+        files = list(getattr(dbg, "files", []) or [])
+    lines.append("## source files ({})".format(len(files)))
+    lines.append("")
+    if files:
+        lines.append("If `has_contents` is yes the original source is dumped "
+                     "verbatim under `original_source/` next to this file.")
+        lines.append("")
+        lines.append("| index | filename | bytes | has_contents |")
+        lines.append("|-------|----------|-------|--------------|")
+        for i, sf in enumerate(files):
+            fn = getattr(sf, "filename", "?")
+            c = getattr(sf, "contents", "") or ""
+            lines.append("| {} | `{}` | {} | {} |".format(
+                i, fn, len(c), "yes" if c else "no"))
+        lines.append("")
 
     cbs = getattr(refl, "constantBlocks", []) or []
     lines.append("## constant buffers ({} declared)".format(len(cbs)))
@@ -553,6 +672,58 @@ def _write_io_md(stage_dir, refl, errors, stage_short):
 
 
 # ===========================================================================
+# original shader source dump
+# ===========================================================================
+
+def _sanitize_source_filename(name, fallback_index):
+    """Strip directory components and replace path-unsafe chars."""
+    import re
+    if not name:
+        return "file_{}".format(fallback_index)
+    # take basename only -- some compilers embed full paths
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return name or "file_{}".format(fallback_index)
+
+
+def _export_original_source(stage_dir, refl, errors, stage_short, counts):
+    """Dump debugInfo.files[i].contents -- the original HLSL/GLSL the
+    developer wrote, when the compiler embedded it (typical for /Zs and
+    Unity-shipped shader debug info)."""
+    counts.setdefault("orig_src_expected", 0)
+    counts.setdefault("orig_src_ok", 0)
+    if refl is None:
+        return
+    dbg = getattr(refl, "debugInfo", None)
+    if dbg is None:
+        return
+    files = list(getattr(dbg, "files", []) or [])
+    if not files:
+        return
+    # only files that actually have contents count toward the expected/ok
+    # tally; filename-only entries are still listed in reflection.md.
+    src_dir = stage_dir / "original_source"
+    used_names = set()
+    for i, sf in enumerate(files):
+        contents = getattr(sf, "contents", "") or ""
+        if not contents:
+            continue
+        counts["orig_src_expected"] += 1
+        fname = _sanitize_source_filename(getattr(sf, "filename", ""), i)
+        # dedupe by prefixing with index when name collides
+        if fname in used_names:
+            fname = "{:02d}_{}".format(i, fname)
+        used_names.add(fname)
+        try:
+            src_dir.mkdir(parents=True, exist_ok=True)
+            (src_dir / fname).write_text(contents, encoding="utf-8")
+            counts["orig_src_ok"] += 1
+        except Exception as e:
+            errors.add("original_source", "{}/{}".format(stage_short, fname),
+                       "write failed", e)
+
+
+# ===========================================================================
 # descriptor accesses -> per-stage bindings
 # ===========================================================================
 
@@ -594,8 +765,50 @@ def _buffer_lookup(controller):
         return {}
 
 
+def _resource_lookup(controller):
+    """Build {resourceId: ResourceDescription} for the whole capture.
+    ResourceDescription.name carries the engine-side debug name (e.g.
+    "Shader xyz pass 3", "GBuffer0 RT") set by the application via
+    SetPrivateData / SetDebugName / vkDebugMarkerSetObjectName."""
+    try:
+        return {r.resourceId: r for r in controller.GetResources()}
+    except Exception:
+        return {}
+
+
+def _resource_name(res_lookup, rid, default="?"):
+    if rid is None or _is_null_id(rid):
+        return default
+    r = res_lookup.get(rid)
+    if r is None:
+        return default
+    n = getattr(r, "name", None)
+    return str(n) if n else default
+
+
+def _extract_defines(cmdline):
+    """Pull (name, value) pairs out of a shader-compiler command line.
+    Handles `-Dfoo=bar`, `-Dfoo`, `/Dfoo=bar`, `/Dfoo`, with optional
+    quoting around the value. Order-preserving."""
+    import re
+    out = []
+    # both `-D` and `/D` prefixes, value optionally `=...`. The lookahead
+    # stops at whitespace, but we also accept quoted values.
+    pattern = re.compile(
+        r"""(?:^|\s)[-/]D
+            ([A-Za-z_][A-Za-z0-9_]*)
+            (?:=(?:"([^"]*)"|'([^']*)'|(\S+)))?""",
+        re.VERBOSE)
+    for m in pattern.finditer(cmdline):
+        name = m.group(1)
+        val = m.group(2) if m.group(2) is not None else (
+            m.group(3) if m.group(3) is not None else m.group(4))
+        out.append((name, val if val is not None else "1"))
+    return out
+
+
 def _export_bindings(out, controller, gfxcap, pipe_resource_id, refls_by_stage,
-                     bound_stages, errors, counts):
+                     bound_stages, errors, counts, res_lookup=None):
     try:
         accesses = list(controller.GetDescriptorAccess())
     except Exception as e:
@@ -604,6 +817,8 @@ def _export_bindings(out, controller, gfxcap, pipe_resource_id, refls_by_stage,
 
     tex_lookup = _texture_lookup(controller)
     buf_lookup = _buffer_lookup(controller)
+    if res_lookup is None:
+        res_lookup = {}
     bound_set = set(bound_stages)
 
     for acc in accesses:
@@ -625,19 +840,19 @@ def _export_bindings(out, controller, gfxcap, pipe_resource_id, refls_by_stage,
         elif kind == "cb":
             _export_cbuffer(stage_dir, controller, gfxcap, acc,
                             refls_by_stage.get(stage_short),
-                            errors, stage_short, slot, counts)
+                            errors, stage_short, slot, counts, res_lookup)
         elif kind == "srv":
             _export_srv(stage_dir, controller, gfxcap, acc,
                         tex_lookup, buf_lookup, errors,
-                        stage_short, slot, array_elem, counts)
+                        stage_short, slot, array_elem, counts, res_lookup)
         elif kind == "uav":
             _export_uav(stage_dir, controller, gfxcap, acc,
                         tex_lookup, buf_lookup, errors,
-                        stage_short, slot, array_elem, counts)
+                        stage_short, slot, array_elem, counts, res_lookup)
         elif kind == "imagesampler":
             _export_srv(stage_dir, controller, gfxcap, acc,
                         tex_lookup, buf_lookup, errors,
-                        stage_short, slot, array_elem, counts)
+                        stage_short, slot, array_elem, counts, res_lookup)
 
 
 def _fetch_one_descriptor(controller, gfxcap, acc, sampler=False):
@@ -664,7 +879,7 @@ def _fetch_one_descriptor(controller, gfxcap, acc, sampler=False):
 
 
 def _export_cbuffer(stage_dir, controller, gfxcap, acc, refl, errors,
-                    stage_short, slot, counts):
+                    stage_short, slot, counts, res_lookup=None):
     counts.setdefault("cb_expected", 0)
     counts.setdefault("cb_ok", 0)
     counts["cb_expected"] += 1
@@ -678,6 +893,8 @@ def _export_cbuffer(stage_dir, controller, gfxcap, acc, refl, errors,
         buffer_id = getattr(desc, "resource", None)
         byte_offset = int(getattr(desc, "byteOffset", 0) or 0)
         byte_size = int(getattr(desc, "byteSize", 0) or 0)
+    if res_lookup is None:
+        res_lookup = {}
 
     cb_meta_name = "(unknown)"
     cb_byte_size_decl = "?"
@@ -717,41 +934,101 @@ def _export_cbuffer(stage_dir, controller, gfxcap, acc, refl, errors,
             errors.add("cbuffer_decode", "{}/b{}".format(stage_short, slot),
                        "GetCBufferVariableContents failed", e)
 
+    # Raw bytes always go to a sibling .bin file. We used to inline a hex
+    # dump in the .md, which made the file 600+ KB for engines that pack
+    # everything into one giant globals cbuffer (Unity "$Globals" etc.).
+    raw_bin = stage_dir / "constant_buffer_b{}.bin".format(slot)
+    if raw:
+        try:
+            raw_bin.write_bytes(raw)
+        except Exception as e:
+            errors.add("cbuffer_bin", "{}/b{}".format(stage_short, slot),
+                       "write failed", e)
+
+    # When a cbuffer has more variables than CB_VAR_INLINE_CAP, the full
+    # variable list goes to a sibling .tsv (tab-separated; trivial to grep
+    # and parse) and the .md keeps only a head/tail preview plus a pointer.
+    CB_VAR_INLINE_CAP = 128
+    var_count = len(var_values)
+    split_vars = var_count > CB_VAR_INLINE_CAP
+    vars_tsv = stage_dir / "constant_buffer_b{}_vars.tsv".format(slot)
+
     title = STAGE_TITLE.get(stage_short, stage_short)
     lines = [
         "# {} -- constant buffer at register b{}".format(title, slot),
         "",
         "Decoded constant buffer values for the GPU's view of register `b{}` "
-        "at this draw, plus the raw byte dump so an LLM can crosscheck the "
-        "decode.".format(slot),
+        "at this draw. Raw bytes live alongside in `constant_buffer_b{}.bin`."
+        .format(slot, slot),
         "",
         "- declared_name: `{}`".format(cb_meta_name),
         "- declared_size: {}".format(cb_byte_size_decl),
         "- bound_size: {}".format(byte_size),
         "- byte_offset_in_buffer: {}".format(byte_offset),
         "- backing_buffer_id: `{}`".format(buffer_id),
+        "- backing_buffer_name: `{}`".format(
+            _resource_name(res_lookup, buffer_id, default="(unnamed)")),
+        "- raw_bytes_size: {}".format(len(raw)),
+        "- raw_bytes_file: `constant_buffer_b{}.bin`".format(slot)
+            if raw else "- raw_bytes_file: (empty)",
         "",
     ]
 
-    if var_values:
-        lines.append("## variables ({} entries)".format(len(var_values)))
+    def _var_row(i, v):
+        n = getattr(v, "name", "?")
+        decl = cb_decl_vars[i] if i < len(cb_decl_vars) else None
+        if decl is not None:
+            o = int(getattr(decl, "byteOffset", 0) or 0)
+            return (n, "{}".format(o), "0x{:X}".format(o),
+                    _shader_var_size(v), _shader_var_type(v),
+                    _shader_var_value_inline(v))
+        return (n, "?", "?", _shader_var_size(v),
+                _shader_var_type(v), _shader_var_value_inline(v))
+
+    if not var_values:
+        lines.append("## variables")
+        lines.append("")
+        lines.append("(none decoded)")
+        lines.append("")
+    elif split_vars:
+        # full table → tsv
+        try:
+            with vars_tsv.open("w", encoding="utf-8") as fp:
+                fp.write("name\toffset\toffset_hex\tsize\ttype\tvalue\n")
+                for i, v in enumerate(var_values):
+                    fp.write("\t".join(str(c) for c in _var_row(i, v)) + "\n")
+        except Exception as e:
+            errors.add("cbuffer_vars_tsv", "{}/b{}".format(stage_short, slot),
+                       "write failed", e)
+        lines.append("## variables ({} entries)".format(var_count))
+        lines.append("")
+        lines.append("This cbuffer carries {} variables -- well above the "
+                     "{}-entry inline cap, so the full list is in "
+                     "`constant_buffer_b{}_vars.tsv` (tab-separated). The "
+                     "preview below is the first 32 and last 8 entries.".format(
+                         var_count, CB_VAR_INLINE_CAP, slot))
+        lines.append("")
+        lines.append("| name | offset | offset_hex | size | type | value |")
+        lines.append("|------|--------|------------|------|------|-------|")
+        head_n, tail_n = 32, 8
+        for i, v in enumerate(var_values[:head_n]):
+            r = _var_row(i, v)
+            lines.append("| `{}` | {} | {} | {} | {} | {} |".format(*r))
+        if var_count > head_n + tail_n:
+            lines.append("| _... {} more entries; see TSV ..._ | | | | | |".format(
+                var_count - head_n - tail_n))
+        for i, v in enumerate(var_values[-tail_n:], start=var_count - tail_n):
+            r = _var_row(i, v)
+            lines.append("| `{}` | {} | {} | {} | {} | {} |".format(*r))
+        lines.append("")
+    else:
+        lines.append("## variables ({} entries)".format(var_count))
         lines.append("")
         lines.append("| name | offset | offset_hex | size | type | value |")
         lines.append("|------|--------|------------|------|------|-------|")
         for i, v in enumerate(var_values):
-            n = getattr(v, "name", "?")
-            decl = cb_decl_vars[i] if i < len(cb_decl_vars) else None
-            if decl is not None:
-                o = int(getattr(decl, "byteOffset", 0) or 0)
-                offset_str = "{}".format(o)
-                offset_hex = "0x{:X}".format(o)
-            else:
-                offset_str = "?"
-                offset_hex = "?"
-            t = _shader_var_type(v)
-            sz = _shader_var_size(v)
-            lines.append("| `{}` | {} | {} | {} | {} | {} |".format(
-                n, offset_str, offset_hex, sz, t, _shader_var_value_inline(v)))
+            r = _var_row(i, v)
+            lines.append("| `{}` | {} | {} | {} | {} | {} |".format(*r))
         lines.append("")
         for v in var_values:
             block = _shader_var_value_expanded(v)
@@ -759,20 +1036,6 @@ def _export_cbuffer(stage_dir, controller, gfxcap, acc, refl, errors,
                 lines.append("### `{}`".format(getattr(v, "name", "?")))
                 lines.extend(block)
                 lines.append("")
-    else:
-        lines.append("## variables")
-        lines.append("")
-        lines.append("(none decoded)")
-        lines.append("")
-
-    lines.append("## raw_bytes ({} B)".format(len(raw)))
-    lines.append("```")
-    if raw:
-        lines.extend(_hex_dump(raw))
-    else:
-        lines.append("(empty)")
-    lines.append("```")
-    lines.append("")
 
     _write_md(target, lines)
     counts["cb_ok"] += 1
@@ -851,10 +1114,12 @@ def _shader_var_value_expanded(v):
 # ---------- SRV / UAV ----------
 
 def _export_srv(stage_dir, controller, gfxcap, acc, tex_lookup, buf_lookup,
-                errors, stage_short, slot, array_elem, counts):
+                errors, stage_short, slot, array_elem, counts, res_lookup=None):
     counts.setdefault("srv_expected", 0)
     counts.setdefault("srv_ok", 0)
     counts["srv_expected"] += 1
+    if res_lookup is None:
+        res_lookup = {}
 
     desc = _fetch_one_descriptor(controller, gfxcap, acc, sampler=False)
     if desc is None:
@@ -868,17 +1133,18 @@ def _export_srv(stage_dir, controller, gfxcap, acc, tex_lookup, buf_lookup,
 
     if resource_id in tex_lookup:
         _export_texture(stage_dir, controller, gfxcap, desc, tex_lookup[resource_id],
-                        errors, stage_short, slot, "srv", array_elem)
+                        errors, stage_short, slot, "srv", array_elem, res_lookup)
         counts["srv_ok"] += 1
     elif resource_id in buf_lookup:
         _export_srv_buffer(stage_dir, controller, gfxcap, desc, buf_lookup[resource_id],
-                           errors, stage_short, slot)
+                           errors, stage_short, slot, res_lookup)
         counts["srv_ok"] += 1
     else:
         target = stage_dir / "srv_t{}.md".format(slot)
         _write_md(target, _md_header("SRV t{}".format(slot), [
             ("type", type_str),
             ("resource_id", resource_id),
+            ("resource_name", _resource_name(res_lookup, resource_id, default="(unnamed)")),
             ("status", "FAILED -- resource not found in capture"),
         ]))
         errors.add("srv", "{}/t{}".format(stage_short, slot),
@@ -886,10 +1152,12 @@ def _export_srv(stage_dir, controller, gfxcap, acc, tex_lookup, buf_lookup,
 
 
 def _export_uav(stage_dir, controller, gfxcap, acc, tex_lookup, buf_lookup,
-                errors, stage_short, slot, array_elem, counts):
+                errors, stage_short, slot, array_elem, counts, res_lookup=None):
     counts.setdefault("uav_expected", 0)
     counts.setdefault("uav_ok", 0)
     counts["uav_expected"] += 1
+    if res_lookup is None:
+        res_lookup = {}
 
     desc = _fetch_one_descriptor(controller, gfxcap, acc, sampler=False)
     if desc is None:
@@ -903,24 +1171,27 @@ def _export_uav(stage_dir, controller, gfxcap, acc, tex_lookup, buf_lookup,
 
     if resource_id in tex_lookup:
         _export_texture(stage_dir, controller, gfxcap, desc, tex_lookup[resource_id],
-                        errors, stage_short, slot, "uav", array_elem)
+                        errors, stage_short, slot, "uav", array_elem, res_lookup)
         counts["uav_ok"] += 1
     elif resource_id in buf_lookup:
         _export_uav_buffer(stage_dir, controller, gfxcap, desc, buf_lookup[resource_id],
-                           errors, stage_short, slot)
+                           errors, stage_short, slot, res_lookup)
         counts["uav_ok"] += 1
     else:
         target = stage_dir / "uav_u{}.md".format(slot)
         _write_md(target, _md_header("UAV u{}".format(slot), [
             ("type", type_str),
             ("resource_id", resource_id),
+            ("resource_name", _resource_name(res_lookup, resource_id, default="(unnamed)")),
             ("status", "FAILED -- resource not found"),
         ]))
         errors.add("uav", "{}/u{}".format(stage_short, slot), "resource id not found")
 
 
 def _export_srv_buffer(stage_dir, controller, gfxcap, desc, buf_desc, errors,
-                       stage_short, slot):
+                       stage_short, slot, res_lookup=None):
+    if res_lookup is None:
+        res_lookup = {}
     md = stage_dir / "buffer_t{}.md".format(slot)
     bin_ = stage_dir / "buffer_t{}.bin".format(slot)
     rid = getattr(desc, "resource", None)
@@ -933,6 +1204,7 @@ def _export_srv_buffer(stage_dir, controller, gfxcap, desc, buf_desc, errors,
         ("kind", "shader resource view (buffer)"),
         ("register", "t{}".format(slot)),
         ("resource_id", rid),
+        ("resource_name", _resource_name(res_lookup, rid, default="(unnamed)")),
         ("byte_offset", offset),
         ("byte_size", size),
         ("element_size", getattr(desc, "elementByteSize", "?")),
@@ -953,7 +1225,9 @@ def _export_srv_buffer(stage_dir, controller, gfxcap, desc, buf_desc, errors,
 
 
 def _export_uav_buffer(stage_dir, controller, gfxcap, desc, buf_desc, errors,
-                       stage_short, slot):
+                       stage_short, slot, res_lookup=None):
+    if res_lookup is None:
+        res_lookup = {}
     md = stage_dir / "uav_u{}.md".format(slot)
     bin_ = stage_dir / "uav_u{}.bin".format(slot)
     rid = getattr(desc, "resource", None)
@@ -966,6 +1240,7 @@ def _export_uav_buffer(stage_dir, controller, gfxcap, desc, buf_desc, errors,
         ("kind", "unordered access view (buffer)"),
         ("register", "u{}".format(slot)),
         ("resource_id", rid),
+        ("resource_name", _resource_name(res_lookup, rid, default="(unnamed)")),
         ("byte_offset", offset),
         ("byte_size", size),
         ("element_size", getattr(desc, "elementByteSize", "?")),
@@ -988,7 +1263,7 @@ def _export_uav_buffer(stage_dir, controller, gfxcap, desc, buf_desc, errors,
 
 
 def _export_texture(stage_dir, controller, gfxcap, desc, tex_desc,
-                    errors, stage_short, slot, kind, array_elem):
+                    errors, stage_short, slot, kind, array_elem, res_lookup=None):
     """kind = 'srv' | 'uav'."""
     if kind == "srv":
         prefix = "texture_t"
@@ -1005,11 +1280,14 @@ def _export_texture(stage_dir, controller, gfxcap, desc, tex_desc,
     dds = stage_dir / "{}{}.dds".format(prefix, slot)
     png = stage_dir / "{}{}.png".format(prefix, slot)
 
+    if res_lookup is None:
+        res_lookup = {}
     rid = getattr(desc, "resource", None)
     fields = [
         ("kind", kind_label),
         ("register", register),
         ("resource_id", rid),
+        ("resource_name", _resource_name(res_lookup, rid, default="(unnamed)")),
         ("dimensions", "{}x{}x{}".format(
             getattr(tex_desc, "width", "?"),
             getattr(tex_desc, "height", "?"),
@@ -1142,9 +1420,11 @@ def _filter_str(f):
 # Input Assembly stage (input_assembly/)
 # ===========================================================================
 
-def _export_input_assembly(out, controller, pipe, errors, counts):
+def _export_input_assembly(out, controller, pipe, errors, counts, res_lookup=None):
     counts.setdefault("ia_expected", 1)
     counts.setdefault("ia_ok", 0)
+    if res_lookup is None:
+        res_lookup = {}
 
     ia_dir = out / "input_assembly"
     ia_dir.mkdir(parents=True, exist_ok=True)
@@ -1195,6 +1475,7 @@ def _export_input_assembly(out, controller, pipe, errors, counts):
         fields = [
             ("slot", i),
             ("resource_id", rid),
+            ("resource_name", _resource_name(res_lookup, rid, default="(unnamed)")),
             ("byte_offset", offset),
             ("byte_stride", stride),
             ("byte_size", size),
@@ -1231,6 +1512,7 @@ def _export_input_assembly(out, controller, pipe, errors, counts):
         stride = int(getattr(ib, "byteStride", 0) or 0)
         fields = [
             ("resource_id", rid),
+            ("resource_name", _resource_name(res_lookup, rid, default="(unnamed)")),
             ("byte_offset", offset),
             ("byte_size", size),
             ("byte_stride", stride),
@@ -1258,7 +1540,10 @@ def _export_input_assembly(out, controller, pipe, errors, counts):
 # Output Merger (output_merger/)
 # ===========================================================================
 
-def _export_output_merger(out, controller, gfxcap, pipe, errors, counts):
+def _export_output_merger(out, controller, gfxcap, pipe, errors, counts,
+                          res_lookup=None):
+    if res_lookup is None:
+        res_lookup = {}
     om_dir = out / "output_merger"
     om_dir.mkdir(parents=True, exist_ok=True)
     om = getattr(pipe, "outputMerger", None)
@@ -1281,7 +1566,7 @@ def _export_output_merger(out, controller, gfxcap, pipe, errors, counts):
         ok = _export_om_target(om_dir, controller, gfxcap, rt, errors,
                                "render_target_{}".format(i),
                                "render target at slot {}".format(i),
-                               "render_target")
+                               "render_target", res_lookup)
         if ok:
             counts["rt_ok"] += 1
 
@@ -1297,7 +1582,7 @@ def _export_output_merger(out, controller, gfxcap, pipe, errors, counts):
             ok = _export_om_target(om_dir, controller, gfxcap, depth, errors,
                                    "depth_target",
                                    "depth/stencil target",
-                                   "depth_target")
+                                   "depth_target", res_lookup)
             if ok:
                 counts["depth_ok"] = 1
 
@@ -1349,15 +1634,19 @@ def _export_output_merger(out, controller, gfxcap, pipe, errors, counts):
         _write_md(ds_md, _md_header("depth-stencil state", fields))
 
 
-def _export_om_target(om_dir, controller, gfxcap, view, errors, name, label, prefix):
+def _export_om_target(om_dir, controller, gfxcap, view, errors, name, label,
+                      prefix, res_lookup=None):
+    if res_lookup is None:
+        res_lookup = {}
     md = om_dir / "{}.md".format(name)
     dds = om_dir / "{}.dds".format(name)
     png = om_dir / "{}.png".format(name)
     rid = getattr(view, "resource", None)
     fields = [
         ("kind", label),
-        ("name", name),
+        ("slot_name", name),
         ("resource_id", rid),
+        ("resource_name", _resource_name(res_lookup, rid, default="(unnamed)")),
         ("view_id", getattr(view, "view", "?")),
         ("type", _enum_str(getattr(view, "type", "?"))),
         ("format", _format_str(getattr(view, "format", None))),
@@ -1477,15 +1766,33 @@ NAV_PREFIX_DESCRIPTIONS = [
 ]
 
 
+def _describe_cbuffer_sidecar(name):
+    """constant_buffer_b3.bin / constant_buffer_b3_vars.tsv -- variant
+    descriptions for the cbuffer sidecar files."""
+    if name.endswith("_vars.tsv") and name.startswith("constant_buffer_b"):
+        reg = name[len("constant_buffer_b"):-len("_vars.tsv")]
+        return "full variable list for constant buffer b{} (TSV)".format(reg)
+    if name.endswith(".bin") and name.startswith("constant_buffer_b"):
+        reg = name[len("constant_buffer_b"):-len(".bin")]
+        return "raw bytes for constant buffer b{}".format(reg)
+    return None
+
+
 def _describe_file(name):
     """Return a one-line description of a file by name."""
     for exact, desc in NAV_DESCRIPTIONS:
         if name == exact:
             return desc
+    cb_side = _describe_cbuffer_sidecar(name)
+    if cb_side:
+        return cb_side
     stem = name.rsplit(".", 1)[0]
     for prefix, reg_letter, template in NAV_PREFIX_DESCRIPTIONS:
         if stem.startswith(prefix):
             slot = stem[len(prefix):]
+            # constant_buffer_b1_vars uses underscore in stem; handled above
+            if "_" in slot:
+                continue
             label = "{}{}".format(reg_letter, slot) if reg_letter else slot
             return template.format(label)
     # texture/uav binary forms
@@ -1529,7 +1836,7 @@ DIR_INTROS = [
 ]
 
 
-def _build_metadata_section(rdc, controller, action, eid):
+def _build_metadata_section(rdc, controller, action, eid, action_parents=None):
     api = _api_name(controller)
     frame_num = "?"
     capture_time = "?"
@@ -1544,11 +1851,16 @@ def _build_metadata_section(rdc, controller, action, eid):
     except OSError:
         size_bytes = "?"
 
+    marker_path = _marker_path(action_parents or [])
+
     lines = [
         "## metadata",
         "",
         "Identifies the capture file, the frame within it, and the specific "
-        "GPU event (the EID) we exported.",
+        "GPU event (the EID) we exported. `marker_path` is the breadcrumb of "
+        "user-inserted debug markers (PushMarker / vkCmdBeginDebugUtilsLabel) "
+        "between the frame root and this draw -- often the most direct hint "
+        "at what rendering pass this draw belongs to.",
         "",
         "| field | value |",
         "|-------|-------|",
@@ -1561,8 +1873,75 @@ def _build_metadata_section(rdc, controller, action, eid):
         "| eid | {} |".format(eid),
         "| action name | `{}` |".format(_action_name(action, controller)),
         "| action flags | `{}` |".format(str(getattr(action, "flags", "?"))),
+        "| marker_path | {} |".format(
+            "`{}`".format(marker_path) if marker_path else "(no markers)"),
         "",
     ]
+    return lines
+
+
+def _build_shader_summary_section(out, bound_stages, res_lookup):
+    """A 'where to find what' table so a first-time LLM can locate the
+    shader name and the compile-flag/variant data without scanning every
+    file. Lives near the top of the README (after the action header).
+
+    For each bound stage:
+      - shader_name (from GetResources via res_lookup)
+      - resource_id
+      - reflection.md path (where compile flags / @cmdline live)
+      - shader.dxbc / .asm / .hlsl paths
+      - original_source/ if any source files were embedded
+    """
+    if not bound_stages:
+        return []
+    lines = [
+        "## shaders at a glance",
+        "",
+        "One row per bound shader stage. The shader's engine-side name (when "
+        "the app set one via `SetPrivateData` / `SetDebugName` / "
+        "`vkDebugMarkerSetObjectName`) is the quickest identification handle. "
+        "For the full compile flags / keyword variants (Unity / Unreal "
+        "defines, `@cmdline` etc.) drill into the linked `reflection.md`.",
+        "",
+        "| stage | shader_name | reflection (compile flags & variants) | binary | disasm | hlsl | original source |",
+        "|-------|-------------|---------------------------------------|--------|--------|------|-----------------|",
+    ]
+    for short in bound_stages:
+        stage_dir = out / short
+        refl = stage_dir / "reflection.md"
+        dxbc = stage_dir / "shader.dxbc"
+        asm = stage_dir / "shader.asm"
+        hlsl = stage_dir / "shader.hlsl"
+        orig = stage_dir / "original_source"
+
+        # pull resource_name back out of reflection.md if it was written --
+        # the writer put it in the second-or-third line ("- resource_name: ")
+        shader_name = "?"
+        try:
+            if refl.exists():
+                for ln in refl.read_text(encoding="utf-8").splitlines()[:30]:
+                    if ln.startswith("- resource_name:"):
+                        shader_name = ln.split(":", 1)[1].strip()
+                        break
+        except Exception:
+            pass
+        # Markdown tables: escape pipes and collapse newlines, otherwise
+        # engine names like "HGRP/Lit ... | KEYWORD_FOO" break the columns.
+        shader_name_cell = (shader_name.replace("|", "\\|")
+                                       .replace("\n", " "))
+
+        def _link(p):
+            return "`{}/{}`".format(short, p.name) if p.exists() else "_(missing)_"
+
+        if orig.is_dir() and any(orig.iterdir()):
+            orig_cell = "`{}/original_source/`".format(short)
+        else:
+            orig_cell = "_(none)_"
+
+        lines.append("| {} | {} | {} | {} | {} | {} | {} |".format(
+            short, shader_name_cell,
+            _link(refl), _link(dxbc), _link(asm), _link(hlsl), orig_cell))
+    lines.append("")
     return lines
 
 
@@ -1636,6 +2015,7 @@ def _build_coverage_section(counts, error_count):
     row("dxbc",             "dxbc_expected",    "dxbc_ok")
     row("asm",              "asm_expected",     "asm_ok")
     row("hlsl",             "hlsl_expected",    "hlsl_ok")
+    row("original_source",  "orig_src_expected", "orig_src_ok")
     row("constant_buffers", "cb_expected",      "cb_ok")
     row("srvs",             "srv_expected",     "srv_ok")
     row("uavs",             "uav_expected",     "uav_ok")
@@ -1661,7 +2041,8 @@ def _build_navigation_section(out):
         if not d.exists():
             continue
         files = sorted(p.name for p in d.iterdir() if p.is_file())
-        if not files:
+        subdirs = sorted(p for p in d.iterdir() if p.is_dir())
+        if not files and not subdirs:
             continue
         lines.append("### `{}/` -- {}".format(dirname, title))
         lines.append("")
@@ -1673,6 +2054,19 @@ def _build_navigation_section(out):
                 lines.append("- `{}/{}` -- {}".format(dirname, f, desc))
             else:
                 lines.append("- `{}/{}`".format(dirname, f))
+        for sd in subdirs:
+            sd_files = sorted(p.name for p in sd.iterdir() if p.is_file())
+            if not sd_files:
+                continue
+            if sd.name == "original_source":
+                desc = ("original HLSL/GLSL the developer wrote, recovered "
+                        "from the shader's embedded debug info "
+                        "({} file(s))".format(len(sd_files)))
+            else:
+                desc = "{} file(s)".format(len(sd_files))
+            lines.append("- `{}/{}/` -- {}".format(dirname, sd.name, desc))
+            for f in sd_files:
+                lines.append("  - `{}/{}/{}`".format(dirname, sd.name, f))
         lines.append("")
     return lines
 
@@ -1707,7 +2101,10 @@ def _build_errors_section(errors):
     return lines
 
 
-def _write_readme(out, rdc, controller, action, eid, counts, errors, bound_stages):
+def _write_readme(out, rdc, controller, action, eid, counts, errors, bound_stages,
+                  action_parents=None, res_lookup=None):
+    if res_lookup is None:
+        res_lookup = {}
     md = out / "README.md"
     name = _action_name(action, controller)
     flags = str(getattr(action, "flags", "?"))
@@ -1724,8 +2121,30 @@ def _write_readme(out, rdc, controller, action, eid, counts, errors, bound_stage
         "- **action_flags**: `{}`".format(flags),
         "- **error_count**: {}".format(n_err),
         "",
+        "## quick start for a first-time LLM",
+        "",
+        "Read in this order:",
+        "",
+        "1. **`## metadata`** below -- the `marker_path` row tells you which "
+        "rendering pass this draw belongs to (e.g. `Frame > Opaque > GBuffer`).",
+        "2. **`## shaders at a glance`** -- the `shader_name` column is the "
+        "engine-side debug name of each bound shader. Click into the linked "
+        "`reflection.md` to see compile flags (Unity / Unreal keyword "
+        "variants live there, in the `@cmdline` row and the `## /D defines "
+        "extracted from @cmdline` table below it).",
+        "3. **`## draw call arguments`** -- index / instance / dispatch counts.",
+        "4. **`## coverage`** -- per-target tally; if anything failed the "
+        "`## errors` section at the bottom names the file with details.",
+        "5. **`## navigation`** -- full file index when you need to drill in.",
+        "",
+        "Looking for a specific resource (a texture, render target, vertex "
+        "buffer)? The per-file `.md` next to each `.bin` / `.dds` carries a "
+        "`resource_name` field with the engine-side name when one was set.",
+        "",
     ]
-    lines.extend(_build_metadata_section(rdc, controller, action, eid))
+    lines.extend(_build_metadata_section(rdc, controller, action, eid,
+                                         action_parents=action_parents))
+    lines.extend(_build_shader_summary_section(out, bound_stages, res_lookup))
     lines.extend(_build_draw_call_section(action))
     lines.extend(_build_coverage_section(counts, n_err))
     lines.extend(_build_navigation_section(out))
@@ -1773,7 +2192,7 @@ def cmd_dump(args):
 
     try:
         roots = controller.GetRootActions()
-        action = _find_action(roots, args.eid)
+        action, action_parents = _find_action(roots, args.eid)
     except Exception as e:
         print("fatal: failed to enumerate actions: {}".format(e), file=sys.stderr)
         return 3
@@ -1786,6 +2205,11 @@ def cmd_dump(args):
         controller.SetFrameEvent(args.eid, True)
     except Exception as e:
         errors.add("replay", "set_frame_event", "SetFrameEvent failed", e)
+
+    # Resource-id -> ResourceDescription, used by every per-target writer
+    # to surface the engine-side debug name (shader name, "GBuffer0 RT",
+    # "MeshFilter Foo VB", etc.).
+    res_lookup = _resource_lookup(controller)
 
     api, pipe = _get_pipe(controller, errors)
     pipe_resource_id = getattr(pipe, "resourceId", None) if pipe is not None else None
@@ -1841,18 +2265,24 @@ def cmd_dump(args):
 
             refl = getattr(shader, "reflection", None)
             refls_by_stage[short] = refl
-            _write_reflection_md(stage_dir, refl, errors, short)
+            _write_reflection_md(stage_dir, refl, errors, short,
+                                 shader=shader, res_lookup=res_lookup)
             _write_io_md(stage_dir, refl, errors, short)
+            _export_original_source(stage_dir, refl, errors, short, counts)
 
         _export_bindings(out, controller, gfxcap, pipe_resource_id,
-                         refls_by_stage, bound_stages, errors, counts)
+                         refls_by_stage, bound_stages, errors, counts,
+                         res_lookup=res_lookup)
 
-        _export_input_assembly(out, controller, pipe, errors, counts)
-        _export_output_merger(out, controller, gfxcap, pipe, errors, counts)
+        _export_input_assembly(out, controller, pipe, errors, counts,
+                               res_lookup=res_lookup)
+        _export_output_merger(out, controller, gfxcap, pipe, errors, counts,
+                              res_lookup=res_lookup)
         _export_rasterizer(out, controller, pipe, errors, counts)
 
     _write_readme(out, args.rdc, controller, action, args.eid, counts,
-                  errors, bound_stages)
+                  errors, bound_stages,
+                  action_parents=action_parents, res_lookup=res_lookup)
 
     try:
         controller.Shutdown()
