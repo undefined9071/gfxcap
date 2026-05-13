@@ -94,6 +94,31 @@ def make_build_env(*, trim_paths: bool = True) -> dict[str, str]:
       - CL  /d1trimfile:<work_src>\\  -- strips __FILE__ macro prefix
       - LINK /PDBALTPATH:%_PDB%       -- strips PDB path to filename only
 
+    NOTE -- THESE ARE LOCAL-BUILD ONLY. Do NOT mirror them into the GitHub
+    Actions workflow. Two reasons, learned the hard way during v1.2.1:
+
+      1. /d1trimfile interacts badly with the v140 toolset's PCH
+         generation under MSBuild's /MP (multi-process) parallel build
+         and produces a C1083 race on driver_dxgi / dxil / spirv,
+         exactly like the /p: overrides documented in `msbuild_run_sln`
+         below. /MP is unavoidable on CI (build time triples without
+         it).
+
+      2. /PDBALTPATH shortens the embedded PDB filename string inside
+         IMAGE_DEBUG_DIRECTORY, which shifts subsequent .rdata offsets
+         and changes the binary's PE shape. /RELEASE writes a non-zero
+         PE Optional Header CheckSum field where prior releases had
+         zero. Both are exactly the kind of PE-shape change that the
+         target's AC PE-shape check has historically rejected at
+         inject time -- the whole reason for the v140 pin in the
+         first place.
+
+    Net: a CI run with these env vars either fails to build at all,
+    or produces a binary that fails to inject. We accept that shipped
+    binaries carry the runner workspace path in __FILE__ strings and
+    the IMAGE_DEBUG_DIRECTORY -- these are static string content with
+    no runtime portability impact (the DLL never reads them).
+
     /JMC is suppressed via the MSBuild property `SupportJustMyCode=false`
     (passed in msbuild_run); putting it on the cl.exe command line as
     /JMC- gets overridden by MSBuild's own /JMC, so the property route is

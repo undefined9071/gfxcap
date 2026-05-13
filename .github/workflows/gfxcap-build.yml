@@ -93,6 +93,21 @@ jobs:
       # (SupportJustMyCode, MultiProcessorCompilation, PreferredToolArchitecture)
       # interacted badly with PCH generation. The bare upstream invocation
       # works.
+      #
+      # Do NOT set CL / LINK env vars on this step. We tried during
+      # v1.2.1 and learned that:
+      #   * CL=/d1trimfile:... breaks the v140 + /MP PCH dance (C1083
+      #     races on driver_dxgi / dxil / spirv -- same failure mode
+      #     the /p: overrides cause)
+      #   * LINK=/PDBALTPATH:%_PDB% shifts .rdata offsets via the
+      #     IMAGE_DEBUG_DIRECTORY CodeView record length
+      #   * LINK=/RELEASE writes a non-zero PE Optional Header CheckSum
+      #     where prior releases had zero
+      # Either of the last two is a PE-shape change vs the v1.0.0/1.1.0/
+      # 1.2.0 binaries the target's AC has been seeing -- exactly the
+      # class of change the v140 pin exists to avoid.
+      # See `.gfxcap/scripts/build.py` `make_build_env` for the long
+      # version of this rationale.
       - name: Build solution (v140)
         shell: powershell
         working-directory: .gfxcap/build/src
