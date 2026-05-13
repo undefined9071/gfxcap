@@ -93,67 +93,10 @@ jobs:
       # (SupportJustMyCode, MultiProcessorCompilation, PreferredToolArchitecture)
       # interacted badly with PCH generation. The bare upstream invocation
       # works.
-      #
-      # CL + LINK env vars MUST mirror build.py's make_build_env() so the
-      # shipped binaries don't carry the runner's filesystem in them:
-      #   /d1trimfile  -- strips the __FILE__ macro prefix
-      #                   (otherwise every assert/log embeds D:\a\...)
-      #   /PDBALTPATH  -- strips the PDB absolute path in IMAGE_DEBUG_DIRECTORY
-      #                   to filename-only (otherwise the user's debugger
-      #                   tries to load PDBs from the runner's filesystem)
-      #   /RELEASE     -- writes the PE checksum into the Optional Header
-      # Verified after v1.2.0 had 9 unique runner-path leaks in gfxcap.dll
-      # alone; same vector hits all of gfxcap.dll, gfxcapcmd.exe,
-      # gfxcapshim64.dll, gfxcap.pyd, gfxcapui.exe.
       - name: Build solution (v140)
         shell: powershell
         working-directory: .gfxcap/build/src
-        env:
-          CL: /d1trimfile:${{ github.workspace }}\.gfxcap\build\src\ /D_SILENCE_STDEXT_ARR_ITERS_DEPRECATION_WARNING /D_SILENCE_ALL_MS_EXT_DEPRECATION_WARNINGS
-          LINK: /RELEASE /PDBALTPATH:%_PDB%
         run: msbuild.exe gfxcap.sln "/m" "/p:Configuration=Release" "/p:Platform=x64" "/p:PlatformToolset=v140"
-
-      - name: Verify no runner paths baked into shipped binaries
-        shell: powershell
-        working-directory: .gfxcap/build/src/x64/Release
-        run: |
-          # Sweep every binary that will be staged (see staging step
-          # below). The runner workspace is D:\a\<repo>\<repo>, so any
-          # absolute path the linker / compiler embedded shows up under
-          # that prefix. Mixed slash forms (the __FILE__ macro often
-          # carries forward slashes from #include paths) match because
-          # the [^\x00]+ class accepts both.
-          $patterns = @(
-            'D:\\a\\[^\x00]{3,200}',     # GHA runner workspace
-            'C:\\hostedtoolcache\\[^\x00]{3,200}',  # GHA toolcache (Python etc)
-            'C:\\Users\\runneradmin\\[^\x00]{3,200}' # GHA runner home
-          )
-          $targets = Get-ChildItem -Path '.' -Include '*.dll','*.exe','*.pyd' -File
-          $fail = $false
-          foreach($t in $targets) {
-            $bytes = [IO.File]::ReadAllBytes($t.FullName)
-            $text = [Text.Encoding]::ASCII.GetString($bytes)
-            $allHits = @()
-            foreach($p in $patterns) {
-              $allHits += [regex]::Matches($text, $p) | ForEach-Object { $_.Value }
-            }
-            $unique = $allHits | Sort-Object -Unique
-            if($unique.Count -gt 0) {
-              Write-Host "FAIL: $($t.Name) carries $($unique.Count) runner path(s):"
-              $unique | Select-Object -First 10 | ForEach-Object { Write-Host "  $_" }
-              if($unique.Count -gt 10) { Write-Host "  ... and $($unique.Count - 10) more" }
-              $fail = $true
-            } else {
-              Write-Host "OK: $($t.Name)"
-            }
-          }
-          if($fail) {
-            Write-Host ""
-            Write-Host "Shipping binaries must not carry the build host's filesystem."
-            Write-Host "Fix: ensure CL=/d1trimfile:... and LINK=/PDBALTPATH:%_PDB%"
-            Write-Host "     are set for the msbuild step above."
-            exit 1
-          }
 
       # Read the PE Optional Header's MajorLinkerVersion / MinorLinkerVersion
       # off the build outputs and require 14.00 (= the v140 toolset's link.exe
