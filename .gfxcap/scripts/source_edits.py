@@ -318,8 +318,10 @@ void LibraryHooks::RegisterFunctionHook(const char *libraryName, const FunctionH
       const QString nm = QString(ShaderProcessors[i].name);
       // Normalize path separators so both `/plugins/...` and
       // `\\plugins\\...` forms match the same suffix check below.
+      // QChar's char-taking ctor is private in Qt5 -- go through the
+      // project's lit() helper so the build matches upstream conventions.
       QString exeNorm = QString(ShaderProcessors[i].executable)
-                          .replace(QChar('\\\\'), QChar('/'));
+                          .replace(lit("\\\\"), lit("/"));
       bool ours = nm.startsWith(lit("gfxcap:")) ||
                   nm == lit("HLSL Decompiler (DXBC)") ||
                   nm == lit("HLSL Decompiler (DXIL)") ||
