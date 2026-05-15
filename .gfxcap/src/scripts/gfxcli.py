@@ -2339,6 +2339,19 @@ def cmd_dump(args):
                   errors, bound_stages,
                   action_parents=action_parents, res_lookup=res_lookup)
 
+    # Folder thumbnail: copy the first available output image to the
+    # root so Windows Explorer's "Large icons" view shows a hero image
+    # per dump. Intentionally not listed in README navigation -- it's
+    # for human Explorer browsing, not LLM consumption.
+    for src in (out / "output_merger" / "render_target_0.png",
+                out / "output_merger" / "depth_target.png"):
+        if src.exists() and src.stat().st_size > 0:
+            try:
+                shutil.copy2(str(src), str(out / "preview.png"))
+            except OSError:
+                pass
+            break
+
     try:
         controller.Shutdown()
     except Exception:
