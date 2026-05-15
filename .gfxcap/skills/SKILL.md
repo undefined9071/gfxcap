@@ -260,16 +260,16 @@ output. User-supplied `--out` is left alone.
     constant_buffer_b<n>.bin          raw constant-buffer bytes
     constant_buffer_b<n>_vars.tsv     full variable table when > 128
                                       entries (TSV, grep-friendly)
-    texture_t<n>.dds + .png + .md
+    texture_t<n>.exr + .png + .md
     buffer_t<n>.bin + .md
     sampler_s<n>.md
-    uav_u<n>.{dds | bin, png?, md}
+    uav_u<n>.{exr | bin, png?, md}
   hull_shader/, domain_shader/,
   geometry_shader/, pixel_shader/,
   compute_shader/                     same shape, when bound
   output_merger/
-    render_target_<n>.dds + .png + .md
-    depth_target.dds + .png + .md
+    render_target_<n>.exr + .png + .md
+    depth_target.exr + .png + .md
     blend_state.md
     depth_stencil_state.md
   rasterizer/
@@ -325,9 +325,15 @@ not exist on the GPU".
 - HLSL decompile uses the bundled `plugins/hlsl-decompiler/` next to
   the `gfxcap` binaries. Decompile failure is non-fatal; `shader.asm`
   is always written as a fallback.
-- Texture export writes both DDS (preserves layout for every format)
-  and PNG (LLM-visible preview, when format permits). PNG conversion
-  failure is recorded in the texture's `.md`.
+- Texture export writes both EXR (linear half-float, HDR-correct,
+  DCC-friendly -- main RTs / G-buffer / depth read as proper float)
+  and PNG (8-bit LLM-visible preview, when format permits). PNG
+  conversion failure is recorded in the texture's `.md`. EXR
+  decompresses BC* blocks; for typical asset-extraction and analysis
+  this is preferable to keeping BC blocks. The one caveat is BC5_SNORM
+  normal maps: RenderDoc's downcast remaps to UNORM for EXR, losing
+  signed-ness. Consult the `format` field in the texture's `.md` and
+  remap manually for SNORM cases.
 - `list --shallow` is the fast triage mode: blanks shader / RT
   columns but still gives you `class`, `marker_path`, `api_call`,
   counts, and the `hint` column. Use it to confirm there's something

@@ -10,7 +10,7 @@ These rank above everything else:
 1. **Information density and reliability beat disk and time.** Be
    profligate. A draw call's worth of state is small in absolute terms;
    spending an extra 50 MB of disk to give the LLM redundant signal
-   (raw bytes alongside decoded values, DDS alongside PNG, asm alongside
+   (raw bytes alongside decoded values, EXR alongside PNG, asm alongside
    HLSL) is a good trade.
 2. **Failures must never be silent.** If the GPU had four textures bound
    and only three exported successfully, an LLM reading the output MUST
@@ -119,16 +119,16 @@ is bound for the action being dumped.
     constant_buffer_b<n>.bin         raw constant-buffer bytes
     constant_buffer_b<n>_vars.tsv    full variable table when
                                      > 128 entries
-    texture_t<n>.dds + .png + .md
+    texture_t<n>.exr + .png + .md
     buffer_t<n>.bin + .md
     sampler_s<n>.md
-    uav_u<n>.{dds | bin, png?, md}
+    uav_u<n>.{exr | bin, png?, md}
   hull_shader/, domain_shader/,
   geometry_shader/, pixel_shader/,
   compute_shader/                    same shape, when bound
   output_merger/
-    render_target_<n>.dds + .png + .md
-    depth_target.dds + .png + .md
+    render_target_<n>.exr + .png + .md
+    depth_target.exr + .png + .md
     blend_state.md
     depth_stencil_state.md
   rasterizer/
@@ -146,9 +146,9 @@ cross-jumping for every question.
 ### Resource duplication policy
 
 If the same texture is bound to both VS (`t3`) and PS (`t3`), we write
-both `vertex_shader/texture_t3.{dds,png,md}` and
-`pixel_shader/texture_t3.{dds,png,md}`. Yes, this is two copies of the
-same DDS. Disk is cheap; locality of analysis is not. The `.md` for
+both `vertex_shader/texture_t3.{exr,png,md}` and
+`pixel_shader/texture_t3.{exr,png,md}`. Yes, this is two copies of the
+same EXR. Disk is cheap; locality of analysis is not. The `.md` for
 each carries the underlying `resource_id` so a deduper can be written
 later if needed.
 
@@ -167,15 +167,29 @@ so an LLM can rely on the layout instead of probing.
 
 ### Texture output: 3-file rule
 
-Every bound texture (and render target, depth target) gets `.dds` +
+Every bound texture (and render target, depth target) gets `.exr` +
 `.png` + `.md`:
 
-- `.dds` — raw GPU layout (handles every format, including BC*)
+- `.exr` — linear half-float OpenEXR. Always-linear (no sRGB
+  confusion), HDR-correct (R11G11B10 / R16G16B16A16 / R32G32B32A32
+  preserved as float), DCC-friendly (Blender / Nuke / Krita / Photoshop
+  open natively). Float depth (D24S8 / D32_FLOAT) reads as proper
+  float values. BC* compressed source decompresses to half float on
+  save -- this is what asset-extraction / mod / analysis pipelines
+  almost always want. Caveat: BC5_SNORM normal maps lose signed-ness
+  via RenderDoc's RGBA8-UNORM downcast; consult the `format` field in
+  the `.md` and remap if you hit that case.
 - `.png` — 8-bit-friendly preview (when format permits); failures land
   in the `.md`
 - `.md` — format / dimensions / mip / array / sample / bind point /
   resource_id, plus pointers to the binary files and any per-file
   failure status
+
+Why EXR over DDS (which prior versions used): EXR is the right
+default for the dump's primary use cases (LLM analysis, asset
+extraction, DCC re-import). DDS only wins for verbatim BC-block
+repackaging into the original game, which is a niche enough workflow
+that we leave it to a future opt-in flag if anyone actually asks.
 
 ### Constant buffer format
 
@@ -345,7 +359,7 @@ Sections, each prefixed with a one-paragraph "what this is" intro:
 Every per-target writer obeys these rules:
 
 1. **The `.md` file is created unconditionally.** A `texture_t3.md`
-   exists even when DDS export failed; its body explains the failure.
+   exists even when EXR export failed; its body explains the failure.
 2. **The collector records every failure.** This is the one place that
    feeds README's coverage table and error section, so adding-but-not-
    recording a failure means the coverage table will lie.
@@ -375,6 +389,6 @@ RenderDoc Python module):
 - `controller.DisassembleShader(...)` → DXBC asm string
 - `controller.GetCBufferVariableContents(...)` → decoded ShaderVariable
   array for a cbuffer slot
-- `controller.SaveTexture(TextureSave, path)` → DDS / PNG / ...
+- `controller.SaveTexture(TextureSave, path)` → EXR / PNG / ...
 - `controller.GetBufferData(buffer_id, offset, length)` → bytes
 - `controller.GetTextures()` / `GetBuffers()` → id lookup tables

@@ -1300,7 +1300,7 @@ def _export_texture(stage_dir, controller, gfxcap, desc, tex_desc,
         kind_label = "unordered access view (texture)"
 
     md = stage_dir / "{}{}.md".format(prefix, slot)
-    dds = stage_dir / "{}{}.dds".format(prefix, slot)
+    exr = stage_dir / "{}{}.exr".format(prefix, slot)
     png = stage_dir / "{}{}.png".format(prefix, slot)
 
     if res_lookup is None:
@@ -1328,12 +1328,17 @@ def _export_texture(stage_dir, controller, gfxcap, desc, tex_desc,
         ("array_element_seen", array_elem),
     ]
 
-    dds_ok = _save_texture(controller, gfxcap, rid, dds, "DDS", errors,
-                           "texture_dds", "{}/{}{}".format(stage_short, prefix, slot))
+    # EXR for analysis / DCC re-import / asset extraction; PNG sibling
+    # for quick eyeball. See DESIGN.md "Texture output: 3-file rule".
+    exr_ok = _save_texture(controller, gfxcap, rid, exr, "EXR", errors,
+                           "texture_exr", "{}/{}{}".format(stage_short, prefix, slot))
     png_ok = _save_texture(controller, gfxcap, rid, png, "PNG", errors,
                            "texture_png", "{}/{}{}".format(stage_short, prefix, slot))
-    fields.append(("dds", "OK" if dds_ok else "FAILED"))
+    fields.append(("exr", "OK" if exr_ok else "FAILED"))
     fields.append(("png", "OK" if png_ok else "FAILED"))
+    snorm_note = _exr_snorm_caveat(_format_str(getattr(tex_desc, "format", None)))
+    if snorm_note:
+        fields.append(("exr_caveat", snorm_note))
 
     _write_md(md, _md_header(title, fields))
 
@@ -1356,6 +1361,26 @@ def _format_str(fmt):
     except Exception:
         pass
     return "/".join(p for p in parts if p) or "?"
+
+
+def _exr_snorm_caveat(format_str):
+    """Return a one-line note iff the source format will lose its
+    signed-ness through RenderDoc's downcast on EXR save.
+
+    The downcast in replay_controller.cpp:787-818 sends BC1-5 / 8-bit
+    SNORM through the RGBA8 UNORM path (sourceHDR=false branch), which
+    biases the [-1, 1] range into [0, 1]. 16-bit SNORM and BC6 take
+    the RGBA32 path and are preserved -- no caveat needed there.
+
+    Returns "" when no caveat applies."""
+    if not format_str or "SNORM" not in format_str:
+        return ""
+    affected = ("BC4", "BC5", "R8")
+    if any(format_str.startswith(p) for p in affected):
+        return ("BC4/BC5/R8 SNORM is downcast to RGBA8 UNORM by RenderDoc "
+                "before EXR save -- the [-1,1] range becomes [0,1]. "
+                "Remap as `value*2 - 1` when consuming.")
+    return ""
 
 
 def _save_texture(controller, gfxcap, resource_id, target_path, file_type,
@@ -1662,7 +1687,7 @@ def _export_om_target(om_dir, controller, gfxcap, view, errors, name, label,
     if res_lookup is None:
         res_lookup = {}
     md = om_dir / "{}.md".format(name)
-    dds = om_dir / "{}.dds".format(name)
+    exr = om_dir / "{}.exr".format(name)
     png = om_dir / "{}.png".format(name)
     rid = getattr(view, "resource", None)
     fields = [
@@ -1678,14 +1703,19 @@ def _export_om_target(om_dir, controller, gfxcap, view, errors, name, label,
         ("first_mip", getattr(view, "firstMip", "?")),
         ("num_mips", getattr(view, "numMips", "?")),
     ]
-    dds_ok = _save_texture(controller, gfxcap, rid, dds, "DDS", errors,
-                           prefix + "_dds", name)
+    # EXR for analysis / DCC re-import / asset extraction; PNG sibling
+    # for quick eyeball. See DESIGN.md "Texture output: 3-file rule".
+    exr_ok = _save_texture(controller, gfxcap, rid, exr, "EXR", errors,
+                           prefix + "_exr", name)
     png_ok = _save_texture(controller, gfxcap, rid, png, "PNG", errors,
                            prefix + "_png", name)
-    fields.append(("dds", "OK" if dds_ok else "FAILED"))
+    fields.append(("exr", "OK" if exr_ok else "FAILED"))
     fields.append(("png", "OK" if png_ok else "FAILED"))
+    snorm_note = _exr_snorm_caveat(_format_str(getattr(view, "format", None)))
+    if snorm_note:
+        fields.append(("exr_caveat", snorm_note))
     _write_md(md, _md_header(label, fields))
-    return dds_ok or png_ok
+    return exr_ok or png_ok
 
 
 # ===========================================================================
@@ -1772,19 +1802,19 @@ NAV_DESCRIPTIONS = [
     ("depth_stencil_state.md",     "depth and stencil test state"),
     ("rasterizer_state.md",        "fill / cull / depth bias / viewports / scissors"),
     ("depth_target.md",            "depth/stencil target metadata + dump status"),
-    ("depth_target.dds",           "depth/stencil target as DDS"),
+    ("depth_target.exr",           "depth/stencil target as EXR (linear float)"),
     ("depth_target.png",           "depth/stencil target as PNG (where convertible)"),
 ]
 
 NAV_PREFIX_DESCRIPTIONS = [
     # (file-name prefix, register-letter, description-template "{}" gets the register / slot label)
     ("constant_buffer_b", "b", "constant buffer at register {} -- decoded values + raw bytes"),
-    ("texture_t",         "t", "SRV texture at register {} -- DDS + PNG + metadata"),
+    ("texture_t",         "t", "SRV texture at register {} -- EXR + PNG + metadata"),
     ("buffer_t",          "t", "SRV buffer at register {} -- raw bin + metadata"),
-    ("uav_u",             "u", "UAV at register {} -- bin/dds + metadata"),
+    ("uav_u",             "u", "UAV at register {} -- bin/exr + metadata"),
     ("sampler_s",         "s", "sampler at register {}"),
     ("vertex_buffer_",    "",  "vertex buffer at slot {}"),
-    ("render_target_",    "",  "render target at slot {} -- DDS + PNG + metadata"),
+    ("render_target_",    "",  "render target at slot {} -- EXR + PNG + metadata"),
     ("srv_t",             "t", "SRV at register {} -- export FAILED, see md"),
 ]
 
@@ -1819,17 +1849,18 @@ def _describe_file(name):
             label = "{}{}".format(reg_letter, slot) if reg_letter else slot
             return template.format(label)
     # texture/uav binary forms
-    if name.startswith("texture_t") and (name.endswith(".dds") or name.endswith(".png")):
+    _IMAGE_EXTS = (".exr", ".png")
+    if name.startswith("texture_t") and name.endswith(_IMAGE_EXTS):
         return "SRV texture (binary)"
     if name.startswith("uav_u") and name.endswith(".bin"):
         return "UAV buffer raw bytes"
-    if name.startswith("uav_u") and (name.endswith(".dds") or name.endswith(".png")):
+    if name.startswith("uav_u") and name.endswith(_IMAGE_EXTS):
         return "UAV texture (binary)"
     if name.startswith("vertex_buffer_") and name.endswith(".bin"):
         return "vertex buffer raw bytes"
     if name.startswith("buffer_t") and name.endswith(".bin"):
         return "SRV buffer raw bytes"
-    if name.startswith("render_target_") and (name.endswith(".dds") or name.endswith(".png")):
+    if name.startswith("render_target_") and name.endswith(_IMAGE_EXTS):
         return "render target (binary)"
     return ""
 
@@ -2161,7 +2192,7 @@ def _write_readme(out, rdc, controller, action, eid, counts, errors, bound_stage
         "5. **`## navigation`** -- full file index when you need to drill in.",
         "",
         "Looking for a specific resource (a texture, render target, vertex "
-        "buffer)? The per-file `.md` next to each `.bin` / `.dds` carries a "
+        "buffer)? The per-file `.md` next to each `.bin` / `.exr` carries a "
         "`resource_name` field with the engine-side name when one was set.",
         "",
     ]

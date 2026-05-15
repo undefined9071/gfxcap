@@ -102,7 +102,8 @@ candidate EIDs without ever opening the GUI.
   keyword-variant context is preserved
 - per-binding constant buffer values (decoded variables alongside the
   raw `.bin` so an LLM can crosscheck decode against ground truth)
-- bound textures (DDS + PNG) and buffers (raw `.bin`); engine-side
+- bound textures (EXR linear half-float + PNG preview) and buffers
+  (raw `.bin`); engine-side
   resource names surfaced on every resource
 - input assembly, output merger, rasterizer state
 - marker path (`Frame > Opaque > GBuffer`) breadcrumb in the README
