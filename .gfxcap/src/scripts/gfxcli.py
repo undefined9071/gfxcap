@@ -46,7 +46,9 @@ import argparse
 import datetime
 import hashlib
 import os
+import re
 import shutil
+import struct
 import subprocess
 import sys
 import traceback
@@ -695,6 +697,114 @@ def _write_io_md(stage_dir, refl, errors, stage_short):
 
 
 # ===========================================================================
+# bindings.md  -- per-stage texture / sampler pairing extracted from HLSL
+# ===========================================================================
+
+# HLSL declaration / call patterns. Verified against SPIRV-Cross output
+# (Endfield / Unity HGRP) -- the typical decompile target. Other Sample*
+# variants (SampleBias / SampleLevel / SampleGrad / SampleCmp / etc.) all
+# share the convention "first arg is the sampler", so a single regex
+# covers them; .Load / .Gather use the same form for the texture side
+# but Load takes no sampler.
+_BIND_TEX_DECL_RE = re.compile(
+    r'(?:Texture(?:1D|2D|3D|Cube|2DArray|CubeArray|2DMS|2DMSArray)|'
+    r'RWTexture\w*|Buffer|StructuredBuffer|RWBuffer|RWStructuredBuffer|'
+    r'ByteAddressBuffer|RWByteAddressBuffer)'
+    r'(?:<[^>]+>)?\s+'
+    r'(\w+)\s*:\s*register\(\s*([tu]\d+)\s*\)\s*;'
+)
+_BIND_SAMP_DECL_RE = re.compile(
+    r'(?:SamplerState|SamplerComparisonState)\s+'
+    r'(\w+)\s*:\s*register\(\s*(s\d+)\s*\)\s*;'
+)
+_BIND_SAMPLE_CALL_RE = re.compile(r'(\w+)\.(Sample\w*|Gather\w*)\(\s*(\w+)')
+_BIND_LOAD_CALL_RE = re.compile(r'(\w+)\.Load\s*\(')
+
+
+def _write_bindings_md(stage_dir, stage_short):
+    """Emit bindings.md showing texture <-> sampler pairs for each
+    sample call in shader.hlsl. Silent no-op if HLSL is missing /
+    failed / has no texture declarations."""
+    from collections import defaultdict
+    hlsl_path = stage_dir / "shader.hlsl"
+    md_path = stage_dir / "bindings.md"
+    if not hlsl_path.exists():
+        return
+    try:
+        text = hlsl_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    if text.startswith("// STATUS: FAILED"):
+        return
+
+    tex_reg = {m.group(1): m.group(2)
+               for m in _BIND_TEX_DECL_RE.finditer(text)}
+    samp_reg = {m.group(1): m.group(2)
+                for m in _BIND_SAMP_DECL_RE.finditer(text)}
+    if not tex_reg:
+        return
+
+    per_tex_samps = defaultdict(lambda: defaultdict(int))
+    per_tex_methods = defaultdict(lambda: defaultdict(int))
+    for m in _BIND_SAMPLE_CALL_RE.finditer(text):
+        tname, method, sname = m.group(1), m.group(2), m.group(3)
+        treg = tex_reg.get(tname)
+        if not treg:
+            continue
+        per_tex_samps[treg][samp_reg.get(sname, "?")] += 1
+        per_tex_methods[treg][method] += 1
+    for m in _BIND_LOAD_CALL_RE.finditer(text):
+        treg = tex_reg.get(m.group(1))
+        if not treg:
+            continue
+        per_tex_methods[treg]["Load"] += 1
+
+    title = STAGE_TITLE.get(stage_short, stage_short)
+    lines = [
+        "# {} -- texture / sampler bindings".format(title),
+        "",
+        "Resolved by parsing `shader.hlsl` for `Texture* / Sampler*` "
+        "register declarations and the `.Sample* / .Gather / .Load` "
+        "calls that reference them. Use this to know which sampler is "
+        "paired with which texture without grepping HLSL yourself.",
+        "",
+        "## per-texture summary",
+        "",
+        "| register | sampler(s) | calls |",
+        "|----------|-----------|-------|",
+    ]
+    sampled = sorted(set(per_tex_samps) | set(per_tex_methods))
+    for treg in sampled:
+        samp_str = ", ".join("`{}` (x{})".format(s, n)
+                             for s, n in sorted(per_tex_samps[treg].items())
+                             ) or "(none)"
+        method_str = ", ".join("{} x{}".format(m, n)
+                               for m, n in sorted(per_tex_methods[treg].items())
+                               ) or "(unused)"
+        lines.append("| `{}` | {} | {} |".format(treg, samp_str, method_str))
+    if not sampled:
+        lines.append("| _(no sample / load calls found in this shader)_ | | |")
+    lines.append("")
+
+    declared = set(tex_reg.values())
+    dead = sorted(declared - set(per_tex_samps) - set(per_tex_methods))
+    if dead:
+        lines.append("## declared but never sampled / loaded")
+        lines.append("")
+        lines.append("These registers appear in the HLSL declarations "
+                     "but have no `.Sample* / .Gather / .Load` call "
+                     "referencing them in the decompile. Likely either "
+                     "dead-stripped binds or accessed via index "
+                     "operators (`tex[xy]`) the parser doesn't track.")
+        lines.append("")
+        for treg in dead:
+            lines.append("- `{}`".format(treg))
+        lines.append("")
+
+    _write_md(md_path, lines)
+
+
+# ===========================================================================
 # original shader source dump
 # ===========================================================================
 
@@ -1228,11 +1338,13 @@ def _export_srv_buffer(stage_dir, controller, gfxcap, desc, buf_desc, errors,
         ("register", "t{}".format(slot)),
         ("resource_id", rid),
         ("resource_name", _resource_name(res_lookup, rid, default="(unnamed)")),
-        ("byte_offset", offset),
+        ("byte_offset_in_buffer", offset),
         ("byte_size", size),
         ("element_size", getattr(desc, "elementByteSize", "?")),
         ("format", _enum_str(getattr(getattr(desc, "format", None), "type", "?"))),
         ("buffer_total_length", getattr(buf_desc, "length", "?")),
+        ("bin_starts_at_buffer_offset", 0),
+        ("is_pre_sliced", True),
     ]
 
     try:
@@ -1264,13 +1376,15 @@ def _export_uav_buffer(stage_dir, controller, gfxcap, desc, buf_desc, errors,
         ("register", "u{}".format(slot)),
         ("resource_id", rid),
         ("resource_name", _resource_name(res_lookup, rid, default="(unnamed)")),
-        ("byte_offset", offset),
+        ("byte_offset_in_buffer", offset),
         ("byte_size", size),
         ("element_size", getattr(desc, "elementByteSize", "?")),
         ("format", _enum_str(getattr(getattr(desc, "format", None), "type", "?"))),
         ("buffer_total_length", getattr(buf_desc, "length", "?")),
         ("counter_byte_offset", getattr(desc, "counterByteOffset", "?")),
         ("buffer_struct_count", getattr(desc, "bufferStructCount", "?")),
+        ("bin_starts_at_buffer_offset", 0),
+        ("is_pre_sliced", True),
     ]
 
     try:
@@ -1336,9 +1450,7 @@ def _export_texture(stage_dir, controller, gfxcap, desc, tex_desc,
                            "texture_png", "{}/{}{}".format(stage_short, prefix, slot))
     fields.append(("exr", "OK" if exr_ok else "FAILED"))
     fields.append(("png", "OK" if png_ok else "FAILED"))
-    snorm_note = _exr_snorm_caveat(_format_str(getattr(tex_desc, "format", None)))
-    if snorm_note:
-        fields.append(("exr_caveat", snorm_note))
+    _append_format_caveats(fields, _format_str(getattr(tex_desc, "format", None)))
 
     _write_md(md, _md_header(title, fields))
 
@@ -1361,6 +1473,44 @@ def _format_str(fmt):
     except Exception:
         pass
     return "/".join(p for p in parts if p) or "?"
+
+
+def _png_color_space(format_str):
+    """How the PNG bytes should be interpreted, given the source GPU
+    format. Empirically verified on a BC7_SRGB sample (predictions vs
+    EXR ground truth match within 8-bit quantization noise -- linear
+    hypothesis is correct, sRGB-encoded hypothesis is 12-13x off):
+
+    For SRGB-suffixed source formats (BC7_SRGB / R8G8B8A8_SRGB / etc.)
+    RenderDoc samples the texture (decoding sRGB to linear), then
+    downcasts to RGBA8 and writes the linear values to PNG without an
+    sRGB / gAMA chunk. Naive importers (Unity TextureImporter with
+    sRGB=ON, Photoshop default) double-decode and produce a 2-3x dark
+    image. Set the importer's sRGB flag to OFF for these PNGs.
+
+    For non-SRGB formats the bytes pass through; interpretation depends
+    on what the original shader author intended."""
+    if not format_str:
+        return None
+    if format_str.endswith("_SRGB"):
+        return ("linear (RenderDoc sampled the SRGB source which decoded "
+                "to linear, then quantized to 8-bit; PNG has no sRGB "
+                "chunk -- set Unity TextureImporter sRGB=OFF to avoid "
+                "double-decode)")
+    return ("as_stored (PNG bytes pass through unchanged from the source "
+            "GPU values; sRGB-flag in your importer depends on author "
+            "intent -- typically OFF for normal maps and data textures)")
+
+
+def _append_format_caveats(fields, format_str):
+    """Append png_color_space + exr_caveat fields when applicable.
+    Centralized so the texture and OM-target writers stay in sync."""
+    cs = _png_color_space(format_str)
+    if cs:
+        fields.append(("png_color_space", cs))
+    sn = _exr_snorm_caveat(format_str)
+    if sn:
+        fields.append(("exr_caveat", sn))
 
 
 def _exr_snorm_caveat(format_str):
@@ -1468,7 +1618,467 @@ def _filter_str(f):
 # Input Assembly stage (input_assembly/)
 # ===========================================================================
 
-def _export_input_assembly(out, controller, pipe, errors, counts, res_lookup=None):
+# ---------------------------------------------------------------------------
+# Generic vertex format decoder. Used by the mesh extractor to walk
+# arbitrary vertex layouts. Engine-agnostic by design -- we never assume
+# what a "normal" or "color" attribute is supposed to look like; we just
+# decode the bytes per the format string and emit the result. The
+# consumer (LLM / human) maps semantic to meaning.
+#
+# Coverage: ~30 standard DXGI / Vulkan formats. R10G10B10A2_{UNORM,UINT}
+# is special-cased as a packed bitfield. R11G11B10_FLOAT and other
+# non-uniform packed formats return None (caller emits raw bytes).
+# ---------------------------------------------------------------------------
+
+_VERTEX_FORMAT_RE = re.compile(
+    r"^R(\d+)(?:G(\d+))?(?:B(\d+))?(?:A(\d+))?_([A-Z]+)$"
+)
+_VERTEX_STRUCT_CHARS = {
+    (32, "FLOAT"): "f", (32, "UINT"): "I", (32, "SINT"): "i",
+    (16, "FLOAT"): "e", (16, "UINT"): "H", (16, "SINT"): "h",
+    (8, "UINT"): "B", (8, "SINT"): "b",
+}
+_VERTEX_NORM_CHARS = {8: "B", 16: "H", 32: "I"}     # for *_UNORM
+_VERTEX_SNORM_CHARS = {8: "b", 16: "h", 32: "i"}    # for *_SNORM
+
+
+def _decode_vertex_attribute(data, byte_offset, format_str):
+    """Decode one vertex's components from `data` at `byte_offset`.
+    Returns a list of Python float / int per the format's compType, or
+    None if the format is unsupported (caller falls back to raw hex).
+    Engine-agnostic: never interprets semantic meaning."""
+    if not format_str:
+        return None
+    if format_str == "R10G10B10A2_UNORM":
+        v = struct.unpack_from("<I", data, byte_offset)[0]
+        return [(v & 0x3FF) / 1023.0,
+                ((v >> 10) & 0x3FF) / 1023.0,
+                ((v >> 20) & 0x3FF) / 1023.0,
+                ((v >> 30) & 0x3) / 3.0]
+    if format_str == "R10G10B10A2_UINT":
+        v = struct.unpack_from("<I", data, byte_offset)[0]
+        return [v & 0x3FF, (v >> 10) & 0x3FF,
+                (v >> 20) & 0x3FF, (v >> 30) & 0x3]
+    m = _VERTEX_FORMAT_RE.match(format_str)
+    if not m:
+        return None
+    comp_bits = [int(x) for x in m.groups()[:4] if x]
+    type_str = m.group(5)
+    if not comp_bits or not all(b == comp_bits[0] for b in comp_bits):
+        return None  # non-uniform packed, e.g. R11G11B10_FLOAT
+    bits = comp_bits[0]
+    n = len(comp_bits)
+    if type_str in ("FLOAT", "UINT", "SINT"):
+        ch = _VERTEX_STRUCT_CHARS.get((bits, type_str))
+        if not ch:
+            return None
+        try:
+            return list(struct.unpack_from("<{}{}".format(n, ch),
+                                           data, byte_offset))
+        except struct.error:
+            return None
+    if type_str == "UNORM":
+        ch = _VERTEX_NORM_CHARS.get(bits)
+        if not ch:
+            return None
+        max_val = float((1 << bits) - 1)
+        try:
+            raw = struct.unpack_from("<{}{}".format(n, ch),
+                                     data, byte_offset)
+        except struct.error:
+            return None
+        return [v / max_val for v in raw]
+    if type_str == "SNORM":
+        ch = _VERTEX_SNORM_CHARS.get(bits)
+        if not ch:
+            return None
+        max_val = float((1 << (bits - 1)) - 1)
+        try:
+            raw = struct.unpack_from("<{}{}".format(n, ch),
+                                     data, byte_offset)
+        except struct.error:
+            return None
+        return [max(v / max_val, -1.0) for v in raw]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Mesh extractor. Reads the vertex / index .bin files we just wrote,
+# scopes to the draw's actual vertex range using action.numIndices /
+# indexOffset / baseVertex, decodes every per-vertex attribute, and
+# emits 4 files:
+#   mesh.obj            POSITION + NORMAL + TEXCOORD0 + face -- standard
+#                       universal mesh format. Only emits a channel when
+#                       the source format produces the expected component
+#                       count (3 for POSITION/NORMAL, 2 for TEXCOORD0).
+#   mesh_vertices.tsv   per-vertex, ALL attributes decoded by format.
+#                       Color, tangent, blend weights / indices, every UV
+#                       set -- the complete data the GPU saw.
+#   mesh_triangles.tsv  triangle list reconstructed from the index buffer.
+#   mesh.md             vertex / triangle counts, bbox from POSITION,
+#                       per-attribute decode status, and explicit notes
+#                       about anything that couldn't be put into OBJ.
+# ---------------------------------------------------------------------------
+
+# Index buffer index width (bytes) -> struct format
+_IB_FORMAT = {2: "<H", 4: "<I"}
+
+
+def _extract_mesh(ia_dir, ia, action, errors, counts):
+    counts.setdefault("mesh_expected", 0)
+    counts.setdefault("mesh_ok", 0)
+    if ia is None or action is None:
+        return
+    layouts = list(getattr(ia, "layouts", []) or [])
+    if not layouts:
+        return
+    counts["mesh_expected"] = 1
+
+    per_vertex_layouts = [l for l in layouts
+                          if not getattr(l, "perInstance", False)]
+    n_per_instance_skipped = len(layouts) - len(per_vertex_layouts)
+    if not per_vertex_layouts:
+        return
+
+    topology = _enum_str(getattr(ia, "topology", "?"))
+    num_indices = int(getattr(action, "numIndices", 0) or 0)
+    index_offset = int(getattr(action, "indexOffset", 0) or 0)
+    base_vertex = int(getattr(action, "baseVertex", 0) or 0)
+
+    if num_indices <= 0:
+        # Indirect / no-vertex draw -- nothing to extract
+        return
+
+    # Index buffer: only present when the action is an indexed draw and
+    # the IA carries an index buffer binding.
+    ib = getattr(ia, "indexBuffer", None)
+    ib_stride = int(getattr(ib, "byteStride", 0) or 0) if ib is not None else 0
+    ib_path = ia_dir / "index_buffer.bin"
+    ib_data = None
+    if ib_stride in _IB_FORMAT and ib_path.exists() and ib_path.stat().st_size > 0:
+        try:
+            ib_data = ib_path.read_bytes()
+        except OSError:
+            ib_data = None
+
+    triangles = []
+    vertex_indices = []  # in-order, with duplicates -- mirrors the IB walk
+    if ib_data is not None:
+        fmt = _IB_FORMAT[ib_stride]
+        start = index_offset * ib_stride
+        end = start + num_indices * ib_stride
+        if end <= len(ib_data):
+            for i in range(num_indices):
+                idx = struct.unpack_from(fmt, ib_data, start + i * ib_stride)[0]
+                vertex_indices.append(idx + base_vertex)
+        else:
+            errors.add("mesh", "index_buffer",
+                       "draw range [{}, {}) exceeds index_buffer.bin "
+                       "({} bytes)".format(start, end, len(ib_data)))
+            return
+    else:
+        # Non-indexed draw: vertex range is [0, numIndices) in the bound
+        # vertex buffers (the .bin we wrote already starts at the bind
+        # offset).
+        for i in range(num_indices):
+            vertex_indices.append(i)
+
+    if topology == "TriangleList":
+        for i in range(0, len(vertex_indices) - 2, 3):
+            triangles.append((vertex_indices[i],
+                              vertex_indices[i + 1],
+                              vertex_indices[i + 2]))
+    # TriangleStrip / other topologies: leave triangles empty, mesh.md
+    # will note the limitation. mesh_vertices.tsv still gets all verts.
+
+    unique_verts = sorted(set(vertex_indices))
+
+    # Per-slot vertex buffer data + stride
+    vbs = list(getattr(ia, "vertexBuffers", []) or [])
+    vb_data = {}
+    vb_stride = {}
+    for slot in range(len(vbs)):
+        vbp = ia_dir / "vertex_buffer_{}.bin".format(slot)
+        if vbp.exists() and vbp.stat().st_size > 0:
+            try:
+                vb_data[slot] = vbp.read_bytes()
+            except OSError:
+                pass
+        vb_stride[slot] = int(getattr(vbs[slot], "byteStride", 0) or 0)
+
+    # decoded[vert_idx] is a dict {column_name: value}. The TSV writer
+    # collects the column union across all vertices; using a dict from
+    # the start lets layouts with different decode paths (component vs
+    # raw_hex) coexist without dropping cells, and removes the four
+    # dict(...) rebuilds per vertex the writer otherwise needs.
+    decoded = {vi: {} for vi in unique_verts}
+    decode_status = []  # (semantic, idx, format, n_decoded, note)
+    comp_letters = ("x", "y", "z", "w")
+    for l in per_vertex_layouts:
+        slot = int(getattr(l, "inputSlot", 0))
+        attr_off = int(getattr(l, "byteOffset", 0))
+        sem = str(getattr(l, "semanticName", "?"))
+        sem_idx = int(getattr(l, "semanticIndex", 0))
+        fmt = _format_str(getattr(l, "format", None))
+        col_prefix = "{}_{}".format(sem, sem_idx)
+        notes = []
+        if slot not in vb_data:
+            decode_status.append((sem, sem_idx, fmt, 0,
+                                  "vertex buffer slot {} missing".format(slot)))
+            continue
+
+        data = vb_data[slot]
+        stride = vb_stride.get(slot, 0)
+        # stride 0 means the GPU reads the same bytes for every vertex
+        # (broadcast). Resolve pos to attr_off; every vertex_index row
+        # in the TSV gets that single value.
+        broadcast = (stride == 0)
+        if broadcast:
+            notes.append("stride 0 -- value broadcast to every vertex")
+
+        # Probe vertex 0 once to commit this layout to a single decode
+        # path: component-decode for the whole vertex set if the format
+        # is supported, raw-hex for the whole set otherwise. This
+        # guarantees a consistent TSV column set across all rows for
+        # this attribute.
+        probe_pos = (0 if broadcast else unique_verts[0] * stride) + attr_off
+        probe = _decode_vertex_attribute(data, probe_pos, fmt)
+        if probe is not None:
+            n_decoded = len(probe)
+            col_keys = ["{}_{}".format(col_prefix, c)
+                        for c in comp_letters[:n_decoded]]
+            for vi in unique_verts:
+                pos = (0 if broadcast else vi * stride) + attr_off
+                comps = _decode_vertex_attribute(data, pos, fmt)
+                if comps is None:
+                    for k in col_keys:
+                        decoded[vi][k] = "?"
+                else:
+                    for k, c in zip(col_keys, comps):
+                        decoded[vi][k] = c
+        else:
+            n_decoded = 0
+            notes.append(
+                "format `{}` not in decoder coverage; raw hex emitted".format(fmt))
+            raw_key = col_prefix + "_raw_hex"
+            for vi in unique_verts:
+                pos = (0 if broadcast else vi * stride) + attr_off
+                raw = data[pos:pos + 16] if pos < len(data) else b""
+                decoded[vi][raw_key] = raw.hex() if raw else "?"
+        decode_status.append((sem, sem_idx, fmt, n_decoded, "; ".join(notes)))
+
+    _write_mesh_outputs(ia_dir, topology, decoded, unique_verts, triangles,
+                         decode_status, ib_stride, num_indices,
+                         n_per_instance_skipped, errors)
+    counts["mesh_ok"] = 1
+
+
+def _write_mesh_outputs(ia_dir, topology, decoded, unique_verts, triangles,
+                         decode_status, ib_stride, num_indices,
+                         n_per_instance_skipped, errors):
+    # ---- vertices TSV: every attribute decoded, every used vertex ----
+    # Column union across all vertex dicts -- catches layouts whose
+    # decode path differed per vertex (rare; mostly belt-and-suspenders
+    # since the extractor now commits one path per layout).
+    if not unique_verts:
+        return
+    col_order = []
+    seen_cols = set()
+    for vi in unique_verts:
+        for k in decoded[vi]:
+            if k not in seen_cols:
+                seen_cols.add(k)
+                col_order.append(k)
+    cols = ["vertex_index"] + col_order
+    vtsv = ia_dir / "mesh_vertices.tsv"
+    try:
+        with vtsv.open("w", encoding="utf-8") as fp:
+            fp.write("\t".join(cols) + "\n")
+            for vi in unique_verts:
+                vmap = decoded[vi]
+                row = [str(vi)]
+                for col in col_order:
+                    v = vmap.get(col, "")
+                    if isinstance(v, float):
+                        row.append(_tsv_escape("{:.6g}".format(v)))
+                    else:
+                        row.append(_tsv_escape(v))
+                fp.write("\t".join(row) + "\n")
+    except OSError as e:
+        errors.add("mesh", "mesh_vertices.tsv", "write failed", e)
+
+    # ---- triangles TSV ----
+    ttsv = ia_dir / "mesh_triangles.tsv"
+    try:
+        with ttsv.open("w", encoding="utf-8") as fp:
+            fp.write("triangle_index\tv0\tv1\tv2\n")
+            for ti, (a, b, c) in enumerate(triangles):
+                fp.write("{}\t{}\t{}\t{}\n".format(ti, a, b, c))
+    except OSError as e:
+        errors.add("mesh", "mesh_triangles.tsv", "write failed", e)
+
+    # ---- pick channels for OBJ ----
+    # OBJ supports POSITION (v), NORMAL (vn), TEXCOORD (vt) only.
+    # We emit a channel only when the source format gave us the standard
+    # component count: POSITION=3, NORMAL=3, TEXCOORD=2. 4-comp POSITION
+    # also accepted (drops w). Anything else -> skip that OBJ channel,
+    # log in mesh.md.
+    obj_pos_cols = None      # list of "POSITION_0_x/y/z"
+    obj_normal_cols = None
+    obj_uv_cols = None
+    pos_status = ""
+    nor_status = ""
+    uv_status = ""
+    for sem, idx, fmt, n_decoded, note in decode_status:
+        if sem == "POSITION" and idx == 0:
+            if n_decoded >= 3:
+                obj_pos_cols = ["POSITION_0_x", "POSITION_0_y", "POSITION_0_z"]
+                pos_status = "OK ({} components, used xyz)".format(n_decoded)
+            else:
+                pos_status = "SKIPPED ({} components from `{}`; OBJ requires 3)".format(
+                    n_decoded, fmt)
+        elif sem == "NORMAL" and idx == 0:
+            if n_decoded >= 3:
+                obj_normal_cols = ["NORMAL_0_x", "NORMAL_0_y", "NORMAL_0_z"]
+                nor_status = "OK ({} components, used xyz)".format(n_decoded)
+            else:
+                nor_status = ("SKIPPED ({} components from `{}`; "
+                              "OBJ vn requires 3 -- raw value in TSV)").format(
+                    n_decoded, fmt)
+        elif sem == "TEXCOORD" and idx == 0:
+            if n_decoded >= 2:
+                obj_uv_cols = ["TEXCOORD_0_x", "TEXCOORD_0_y"]
+                uv_status = "OK ({} components, used xy)".format(n_decoded)
+            else:
+                uv_status = "SKIPPED ({} components from `{}`; OBJ vt requires 2)".format(
+                    n_decoded, fmt)
+
+    # ---- OBJ ----
+    # The per-corner format string is keyed by (has_uv, has_normal) --
+    # OBJ syntax is "v/vt/vn", with empties dropped: "v" / "v/vt" /
+    # "v//vn" / "v/vt/vn". Table-driven so the four formats sit side by
+    # side rather than spread across nested ifs.
+    _OBJ_CORNER_FMT = {
+        (False, False): "{0}",
+        (True,  False): "{0}/{0}",
+        (False, True):  "{0}//{0}",
+        (True,  True):  "{0}/{0}/{0}",
+    }
+    obj_path = ia_dir / "mesh.obj"
+    if obj_pos_cols is not None and triangles:
+        try:
+            obj_idx_of = {vi: i + 1 for i, vi in enumerate(unique_verts)}
+            with obj_path.open("w", encoding="utf-8") as fp:
+                fp.write("# Extracted by gfxcli from input_assembly/. "
+                         "See mesh.md for caveats.\n")
+                for vi in unique_verts:
+                    vmap = decoded[vi]
+                    fp.write("v {:.6g} {:.6g} {:.6g}\n".format(
+                        vmap.get(obj_pos_cols[0], 0.0),
+                        vmap.get(obj_pos_cols[1], 0.0),
+                        vmap.get(obj_pos_cols[2], 0.0)))
+                if obj_uv_cols is not None:
+                    for vi in unique_verts:
+                        vmap = decoded[vi]
+                        fp.write("vt {:.6g} {:.6g}\n".format(
+                            vmap.get(obj_uv_cols[0], 0.0),
+                            vmap.get(obj_uv_cols[1], 0.0)))
+                if obj_normal_cols is not None:
+                    for vi in unique_verts:
+                        vmap = decoded[vi]
+                        fp.write("vn {:.6g} {:.6g} {:.6g}\n".format(
+                            vmap.get(obj_normal_cols[0], 0.0),
+                            vmap.get(obj_normal_cols[1], 0.0),
+                            vmap.get(obj_normal_cols[2], 0.0)))
+                corner_fmt = _OBJ_CORNER_FMT[(obj_uv_cols is not None,
+                                              obj_normal_cols is not None)]
+                for a, b, c in triangles:
+                    if a not in obj_idx_of or b not in obj_idx_of or c not in obj_idx_of:
+                        continue
+                    fp.write("f {} {} {}\n".format(
+                        corner_fmt.format(obj_idx_of[a]),
+                        corner_fmt.format(obj_idx_of[b]),
+                        corner_fmt.format(obj_idx_of[c])))
+        except OSError as e:
+            errors.add("mesh", "mesh.obj", "write failed", e)
+
+    # ---- bbox from POSITION ----
+    bbox_min = bbox_max = None
+    if obj_pos_cols is not None:
+        for vi in unique_verts:
+            vmap = decoded[vi]
+            try:
+                p = (float(vmap[obj_pos_cols[0]]),
+                     float(vmap[obj_pos_cols[1]]),
+                     float(vmap[obj_pos_cols[2]]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if bbox_min is None:
+                bbox_min = list(p)
+                bbox_max = list(p)
+            else:
+                for i in range(3):
+                    if p[i] < bbox_min[i]: bbox_min[i] = p[i]
+                    if p[i] > bbox_max[i]: bbox_max[i] = p[i]
+
+    # ---- mesh.md ----
+    md_lines = [
+        "# Mesh -- extracted from input_assembly",
+        "",
+        "Reconstructed by `gfxcli` from `vertex_buffer_*.bin` + "
+        "`index_buffer.bin` + `input_layout.md`. The vertex range is "
+        "scoped to this draw via the action's `numIndices` / "
+        "`indexOffset` / `baseVertex` -- not the full bound buffer.",
+        "",
+        "- topology: {}".format(topology),
+        "- index_count: {}".format(num_indices),
+        "- index_format: {}".format(
+            "R{}_UINT".format(ib_stride * 8) if ib_stride else "(non-indexed)"),
+        "- unique_vertex_count: {}".format(len(unique_verts)),
+        "- triangle_count: {}".format(len(triangles)),
+        "- per_instance_attributes_skipped: {}".format(n_per_instance_skipped),
+    ]
+    if bbox_min is not None:
+        md_lines.append("- bbox_min: ({:.6g}, {:.6g}, {:.6g})".format(*bbox_min))
+        md_lines.append("- bbox_max: ({:.6g}, {:.6g}, {:.6g})".format(*bbox_max))
+    md_lines.append("")
+    md_lines.append("## attribute decode status")
+    md_lines.append("")
+    md_lines.append("| semantic | idx | format | components decoded | note |")
+    md_lines.append("|----------|-----|--------|--------------------|------|")
+    for sem, idx, fmt, n_decoded, note in decode_status:
+        md_lines.append("| `{}` | {} | {} | {} | {} |".format(
+            sem, idx, fmt, n_decoded, note or "OK"))
+    md_lines.append("")
+    md_lines.append("## OBJ channel inclusion")
+    md_lines.append("")
+    md_lines.append("- `v` (POSITION_0): {}".format(pos_status or "absent"))
+    md_lines.append("- `vt` (TEXCOORD_0): {}".format(uv_status or "absent"))
+    md_lines.append("- `vn` (NORMAL_0): {}".format(nor_status or "absent"))
+    md_lines.append("")
+    if topology != "TriangleList":
+        md_lines.append("Topology is `{}`; mesh.obj face emission only "
+                        "supports TriangleList for now. mesh_vertices.tsv "
+                        "is still complete.".format(topology))
+        md_lines.append("")
+    md_lines.append("## files")
+    md_lines.append("")
+    md_lines.append("- `mesh.obj` -- POSITION (+ NORMAL / TEXCOORD0 when "
+                    "format yields the standard component count) + face. "
+                    "Universal mesh format; opens in Blender / Unity / "
+                    "Maya / MeshLab.")
+    md_lines.append("- `mesh_vertices.tsv` -- per-vertex, every attribute "
+                    "from input_layout decoded by its DXGI format. "
+                    "Includes COLOR / TANGENT / multiple TEXCOORD sets / "
+                    "BLENDWEIGHTS / BLENDINDICES, and any others present.")
+    md_lines.append("- `mesh_triangles.tsv` -- triangle list from the "
+                    "index buffer (post-`baseVertex` adjustment).")
+    md_lines.append("")
+    _write_md(ia_dir / "mesh.md", md_lines)
+
+
+def _export_input_assembly(out, controller, pipe, errors, counts,
+                           res_lookup=None, action=None):
     counts.setdefault("ia_expected", 1)
     counts.setdefault("ia_ok", 0)
     if res_lookup is None:
@@ -1524,9 +2134,11 @@ def _export_input_assembly(out, controller, pipe, errors, counts, res_lookup=Non
             ("slot", i),
             ("resource_id", rid),
             ("resource_name", _resource_name(res_lookup, rid, default="(unnamed)")),
-            ("byte_offset", offset),
+            ("byte_offset_in_buffer", offset),
             ("byte_stride", stride),
             ("byte_size", size),
+            ("bin_starts_at_buffer_offset", 0),
+            ("is_pre_sliced", True),
         ]
         if size > 0:
             try:
@@ -1561,15 +2173,26 @@ def _export_input_assembly(out, controller, pipe, errors, counts, res_lookup=Non
         fields = [
             ("resource_id", rid),
             ("resource_name", _resource_name(res_lookup, rid, default="(unnamed)")),
-            ("byte_offset", offset),
+            ("byte_offset_in_buffer", offset),
             ("byte_size", size),
             ("byte_stride", stride),
+            ("bin_starts_at_buffer_offset", 0),
+            ("is_pre_sliced", True),
         ]
-        if rid is not None and not _is_null_id(rid) and size > 0:
+        if rid is not None and not _is_null_id(rid):
+            # Mirror the vertex-buffer fallback: D3D11 frequently reports
+            # IB byte_size as 0; in that case fetch from offset to end of
+            # source buffer (size=0 in GetBufferData = full remainder).
+            # Without this the .bin never gets written and downstream
+            # mesh extraction has no indices to walk.
             try:
-                data = bytes(controller.GetBufferData(rid, offset, size))
+                if size > 0:
+                    data = bytes(controller.GetBufferData(rid, offset, size))
+                    fields.append(("bin", "index_buffer.bin ({} B)".format(len(data))))
+                else:
+                    data = bytes(controller.GetBufferData(rid, offset, 0))
+                    fields.append(("bin", "index_buffer.bin ({} B, full buffer)".format(len(data))))
                 bin_.write_bytes(data)
-                fields.append(("bin", "index_buffer.bin ({} B)".format(len(data))))
             except Exception as e:
                 bin_.write_bytes(b"")
                 fields.append(("bin", "FAILED: {}".format(e)))
@@ -1582,6 +2205,12 @@ def _export_input_assembly(out, controller, pipe, errors, counts, res_lookup=Non
         bin_.write_bytes(b"")
 
     counts["ia_ok"] = 1
+
+    # Mesh extraction runs after all .bin files are on disk so it can
+    # reuse them without re-fetching from the controller. Silently
+    # no-ops on draws with no IA / no vertex layout / num_indices == 0
+    # (compute / clear / copy / indirect-without-readable-args).
+    _extract_mesh(ia_dir, ia, action, errors, counts)
 
 
 # ===========================================================================
@@ -1711,9 +2340,7 @@ def _export_om_target(om_dir, controller, gfxcap, view, errors, name, label,
                            prefix + "_png", name)
     fields.append(("exr", "OK" if exr_ok else "FAILED"))
     fields.append(("png", "OK" if png_ok else "FAILED"))
-    snorm_note = _exr_snorm_caveat(_format_str(getattr(view, "format", None)))
-    if snorm_note:
-        fields.append(("exr_caveat", snorm_note))
+    _append_format_caveats(fields, _format_str(getattr(view, "format", None)))
     _write_md(md, _md_header(label, fields))
     return exr_ok or png_ok
 
@@ -1795,9 +2422,14 @@ NAV_DESCRIPTIONS = [
     ("shader.hlsl",                "decompiled HLSL (text)"),
     ("reflection.md",              "shader reflection: cbuffer / SRV / sampler / UAV layout"),
     ("io_signatures.md",           "input + output register signatures"),
+    ("bindings.md",                "texture <-> sampler pairing (parsed from shader.hlsl Sample/Load calls)"),
     ("input_layout.md",            "vertex layout: how vertex buffer bytes map to vs inputs"),
     ("index_buffer.md",            "index buffer metadata"),
     ("index_buffer.bin",           "index buffer raw bytes"),
+    ("mesh.obj",                   "extracted mesh in universal OBJ format (POSITION + NORMAL + TEXCOORD0 + face)"),
+    ("mesh.md",                    "mesh extraction summary: vertex/triangle counts, bbox, attribute decode status"),
+    ("mesh_vertices.tsv",          "per-vertex full attribute dump (every semantic decoded by format)"),
+    ("mesh_triangles.tsv",         "triangle list (vertex indices) reconstructed from index buffer"),
     ("blend_state.md",             "blend / per-rt blend / sample mask"),
     ("depth_stencil_state.md",     "depth and stencil test state"),
     ("rasterizer_state.md",        "fill / cull / depth bias / viewports / scissors"),
@@ -2077,6 +2709,7 @@ def _build_coverage_section(counts, error_count):
     row("render_targets",   "rt_expected",      "rt_ok")
     row("depth_target",     "depth_expected",   "depth_ok")
     row("input_assembly",   "ia_expected",      "ia_ok")
+    row("mesh",             "mesh_expected",    "mesh_ok")
     row("rasterizer",       "rs_expected",      "rs_ok")
     lines.append("")
     return lines
@@ -2324,13 +2957,14 @@ def cmd_dump(args):
                                  shader=shader, res_lookup=res_lookup)
             _write_io_md(stage_dir, refl, errors, short)
             _export_original_source(stage_dir, refl, errors, short, counts)
+            _write_bindings_md(stage_dir, short)
 
         _export_bindings(out, controller, gfxcap, pipe_resource_id,
                          refls_by_stage, bound_stages, errors, counts,
                          res_lookup=res_lookup)
 
         _export_input_assembly(out, controller, pipe, errors, counts,
-                               res_lookup=res_lookup)
+                               res_lookup=res_lookup, action=action)
         _export_output_merger(out, controller, gfxcap, pipe, errors, counts,
                               res_lookup=res_lookup)
         _export_rasterizer(out, controller, pipe, errors, counts)

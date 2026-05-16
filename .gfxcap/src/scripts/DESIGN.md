@@ -191,6 +191,57 @@ extraction, DCC re-import). DDS only wins for verbatim BC-block
 repackaging into the original game, which is a niche enough workflow
 that we leave it to a future opt-in flag if anyone actually asks.
 
+### PNG color space
+
+Empirically verified against EXR ground truth (BC7_SRGB sample,
+center 256x256 region): for SRGB-suffixed source formats RenderDoc
+samples the texture (decoding sRGB to linear), downcasts to RGBA8,
+and writes the linear values to PNG **without an sRGB / gAMA chunk**.
+Naive importers (Unity TextureImporter sRGB=ON, Photoshop default)
+double-decode and produce a 2-3x dark image. The texture's `.md`
+carries a `png_color_space` field that records this:
+
+- `linear (...)` for SRGB sources -- set Unity `sRGB=OFF`
+- `as_stored (...)` for non-SRGB sources -- interpretation depends on
+  author intent
+
+### Mesh extraction (built-in)
+
+`gfxcli dump` runs a generic mesh extractor as the last step of the
+input-assembly pass. It reads the just-written `vertex_buffer_*.bin` +
+`index_buffer.bin` + `input_layout.md`, scopes the vertex range to
+this draw via the action's `numIndices` / `indexOffset` /
+`baseVertex` (so the output reflects what this draw actually
+consumes, not the full bound buffer), and emits four files into
+`input_assembly/`:
+
+| file | content |
+|------|---------|
+| `mesh.obj` | universal mesh: POSITION + NORMAL + TEXCOORD0 + face. Each channel only emitted when the source format's component count matches OBJ's expectation (3 for POSITION/NORMAL, 2 for TEXCOORD). Opens in Blender / Unity / Maya / MeshLab. |
+| `mesh_vertices.tsv` | per-vertex, every input_layout attribute decoded by its DXGI format. Includes COLOR / TANGENT / multiple TEXCOORD sets / BLENDWEIGHTS / BLENDINDICES / anything else present. This is the **complete** mesh data the GPU saw. |
+| `mesh_triangles.tsv` | triangle list (vertex indices) reconstructed from the index buffer after `baseVertex` adjustment. |
+| `mesh.md` | vertex / triangle counts, POSITION bbox, per-attribute decode status, OBJ channel inclusion notes. |
+
+The extractor is **engine-agnostic**: it decodes per the DXGI format
+string and never interprets semantic meaning. If a layout uses an
+unusual packing (e.g. NORMAL stored as `R32_FLOAT` for octahedral
+encoding), the value lands in `mesh_vertices.tsv` as-is and the OBJ
+file skips the corresponding channel with a note in `mesh.md`. The
+consumer (LLM or human) decides how to interpret -- the tool does not
+guess.
+
+Format coverage in the decoder (`_decode_vertex_attribute`):
+
+- All uniform `R8/16/32` variants × `FLOAT / UINT / SINT / UNORM /
+  SNORM` (~25 formats)
+- `R10G10B10A2_UNORM` and `R10G10B10A2_UINT` (packed bitfield)
+- Anything outside this set lands in `mesh_vertices.tsv` as a
+  `<semantic>_<idx>_raw_hex` column and is noted in `mesh.md`.
+
+Topology handling: `TriangleList` for `mesh.obj` face emission.
+Other topologies still get `mesh_vertices.tsv` + `mesh_triangles.tsv`
+content as appropriate, with the limitation noted.
+
 ### Constant buffer format
 
 Designed for LLM crosscheck: human-readability is sacrificed for

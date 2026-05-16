@@ -284,8 +284,47 @@ output. User-supplied `--out` is left alone.
 | Compile defines (`/D` macros) | `<stage>/reflection.md` "compile flags" section |
 | Which pass this draw belongs to | `README.md` metadata `marker_path` row |
 | Resource identity of any RT / VB / texture | the `resource_name` field in that file's `.md` |
+| Which sampler is paired with each texture | `<stage>/bindings.md` |
+| PNG color space for Unity import | `png_color_space` field in each texture / RT `.md` |
+| Vertex / index buffer raw bytes layout | the `byte_offset_in_buffer` / `is_pre_sliced` fields in `input_assembly/*.md` |
 | Original (un-compiled) shader source | `<stage>/original_source/` (only when present) |
 | What failed in the export | `README.md` `## errors` section and any `STATUS: FAILED` headers |
+
+### Notes for downstream re-import (Unity / Blender / etc.)
+
+**Texture import in Unity:**
+- For PNGs: read the `png_color_space` field in the texture's `.md`.
+  When it says `linear (...)` set `Texture Importer -> sRGB (Color
+  Texture) = OFF` -- the PNG bytes are already linear and Unity's
+  default sRGB import would double-decode (2-3x darker output). When it
+  says `as_stored (...)` interpret per author intent (typically OFF for
+  normal maps and data textures, ON for color textures).
+- DDS is NOT supported by Unity's standard `TextureImporter`. Use the
+  `.png` (color / 8-bit) or `.exr` (HDR / depth / float). KTX2 in
+  Unity 6+ is an option for repacking BC blocks but the dump doesn't
+  emit it directly.
+
+**Mesh extraction:**
+- `dump` runs a built-in mesh extractor that emits these into
+  `input_assembly/`:
+  - `mesh.obj` -- universal POSITION + NORMAL + TEXCOORD0 + face
+  - `mesh_vertices.tsv` -- every per-vertex attribute decoded by its
+    DXGI format (POSITION, NORMAL, TANGENT, COLOR, all TEXCOORD sets,
+    BLENDWEIGHTS, BLENDINDICES -- whatever the layout declares)
+  - `mesh_triangles.tsv` -- triangle list from index buffer
+  - `mesh.md` -- vertex / triangle counts, bbox, per-attribute decode
+    status, OBJ channel inclusion notes
+- Vertex range is scoped to **this draw** via `action.numIndices /
+  indexOffset / baseVertex` -- not the full bound buffer.
+- Extractor is engine-agnostic: decodes by DXGI format, never guesses
+  semantic meaning. Unusual packings (e.g. `R32_FLOAT` for an
+  octahedral normal) land verbatim in `mesh_vertices.tsv`, and the
+  OBJ channel is omitted with a note in `mesh.md`. Consumer decides
+  how to interpret.
+- Underlying `vertex_buffer_<i>.bin` and `index_buffer.bin` are
+  **pre-sliced** -- byte 0 of the `.bin` is the first byte of the
+  draw's bound range. See the `bin_starts_at_buffer_offset` /
+  `is_pre_sliced` fields in the buffer `.md` files.
 
 ### Failure-handling contract
 

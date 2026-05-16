@@ -103,12 +103,20 @@ candidate EIDs without ever opening the GUI.
 - per-binding constant buffer values (decoded variables alongside the
   raw `.bin` so an LLM can crosscheck decode against ground truth)
 - bound textures (EXR linear half-float + PNG preview) and buffers
-  (raw `.bin`); engine-side
-  resource names surfaced on every resource
+  (raw, pre-sliced `.bin` -- the draw's `byte_offset` is already
+  applied); engine-side resource names surfaced on every resource
+- per-stage `bindings.md` showing texture <-> sampler pairings parsed
+  out of the decompiled HLSL
 - input assembly, output merger, rasterizer state
+- generic mesh extraction: `mesh.obj` (universal) + `mesh_vertices.tsv`
+  (every attribute decoded by DXGI format) + `mesh_triangles.tsv` --
+  scoped to the draw's actual vertex range via `numIndices` /
+  `baseVertex`
 - marker path (`Frame > Opaque > GBuffer`) breadcrumb in the README
 - coverage report and per-target failure log so partial failures cannot
   go unnoticed
+- per-texture `png_color_space` hint so Unity / Photoshop importers
+  can be configured correctly (PNG bytes are linear for SRGB sources)
 
 See [`.gfxcap/src/scripts/DESIGN.md`](.gfxcap/src/scripts/DESIGN.md) for
 the output layout reference, the CLI rationale, and the per-file
