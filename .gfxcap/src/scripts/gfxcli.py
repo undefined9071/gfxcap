@@ -1339,18 +1339,17 @@ def _export_srv_buffer(stage_dir, controller, gfxcap, desc, buf_desc, errors,
         ("resource_id", rid),
         ("resource_name", _resource_name(res_lookup, rid, default="(unnamed)")),
         ("byte_offset_in_buffer", offset),
-        ("byte_size", size),
+        ("byte_size", _byte_size_field(size)),
         ("element_size", getattr(desc, "elementByteSize", "?")),
         ("format", _enum_str(getattr(getattr(desc, "format", None), "type", "?"))),
         ("buffer_total_length", getattr(buf_desc, "length", "?")),
-        ("bin_starts_at_buffer_offset", 0),
-        ("is_pre_sliced", True),
     ]
 
     try:
         data = bytes(controller.GetBufferData(rid, offset, size))
         bin_.write_bytes(data)
-        fields.append(("bin", "buffer_t{}.bin ({} B)".format(slot, len(data))))
+        fields.append(("bin", _bin_annotation(
+            "buffer_t{}.bin".format(slot), len(data), size, offset)))
     except Exception as e:
         bin_.write_bytes(b"")
         fields.append(("bin", "FAILED: {}".format(e)))
@@ -1377,20 +1376,19 @@ def _export_uav_buffer(stage_dir, controller, gfxcap, desc, buf_desc, errors,
         ("resource_id", rid),
         ("resource_name", _resource_name(res_lookup, rid, default="(unnamed)")),
         ("byte_offset_in_buffer", offset),
-        ("byte_size", size),
+        ("byte_size", _byte_size_field(size)),
         ("element_size", getattr(desc, "elementByteSize", "?")),
         ("format", _enum_str(getattr(getattr(desc, "format", None), "type", "?"))),
         ("buffer_total_length", getattr(buf_desc, "length", "?")),
         ("counter_byte_offset", getattr(desc, "counterByteOffset", "?")),
         ("buffer_struct_count", getattr(desc, "bufferStructCount", "?")),
-        ("bin_starts_at_buffer_offset", 0),
-        ("is_pre_sliced", True),
     ]
 
     try:
         data = bytes(controller.GetBufferData(rid, offset, size))
         bin_.write_bytes(data)
-        fields.append(("bin", "uav_u{}.bin ({} B)".format(slot, len(data))))
+        fields.append(("bin", _bin_annotation(
+            "uav_u{}.bin".format(slot), len(data), size, offset)))
     except Exception as e:
         bin_.write_bytes(b"")
         fields.append(("bin", "FAILED: {}".format(e)))
@@ -2077,6 +2075,34 @@ def _write_mesh_outputs(ia_dir, topology, decoded, unique_verts, triangles,
     _write_md(ia_dir / "mesh.md", md_lines)
 
 
+def _byte_size_field(size):
+    """Render the API-reported byte_size in a way that doesn't look
+    like a bug when the API didn't expose it.
+
+    D3D11 commonly reports byteSize = 0 for VB / IB / SRV buffer
+    bindings (the format gives byte stride + offset but defers size
+    to the resource). Showing the literal 0 alongside a multi-MB
+    `.bin` file (which we read with the "size=0 means full
+    remainder" fallback) reads like a contradiction. Render as
+    `unknown` instead; the `bin:` annotation explains the coverage.
+    """
+    return "unknown" if size == 0 else size
+
+
+def _bin_annotation(bin_name, written, api_size, source_offset):
+    """One-line annotation for the `bin:` field. Always names the
+    source-buffer byte range the .bin covers so the reader doesn't
+    have to compute it. Distinguishes 'API gave a size' from 'API
+    didn't, we read to end of buffer' explicitly so neither side
+    contradicts the other."""
+    if api_size > 0:
+        return "{} ({} B; covers source_buffer[{}, {}))".format(
+            bin_name, written, source_offset, source_offset + written)
+    return ("{} ({} B; covers source_buffer[{}, {}) -- API byteSize was 0, "
+            "bin reads to end of buffer)".format(
+                bin_name, written, source_offset, source_offset + written))
+
+
 def _export_input_assembly(out, controller, pipe, errors, counts,
                            res_lookup=None, action=None):
     counts.setdefault("ia_expected", 1)
@@ -2136,30 +2162,22 @@ def _export_input_assembly(out, controller, pipe, errors, counts,
             ("resource_name", _resource_name(res_lookup, rid, default="(unnamed)")),
             ("byte_offset_in_buffer", offset),
             ("byte_stride", stride),
-            ("byte_size", size),
-            ("bin_starts_at_buffer_offset", 0),
-            ("is_pre_sliced", True),
+            ("byte_size", _byte_size_field(size)),
         ]
-        if size > 0:
-            try:
-                data = bytes(controller.GetBufferData(rid, offset, size))
+        try:
+            # size == 0 -> "from offset to end of source buffer" (D3D11
+            # common case where the binding doesn't carry a byte count).
+            data = bytes(controller.GetBufferData(rid, offset, size if size > 0 else 0))
+            if data:
                 bin_.write_bytes(data)
-                fields.append(("bin", "vertex_buffer_{}.bin ({} B)".format(i, len(data))))
-            except Exception as e:
-                bin_.write_bytes(b"")
-                fields.append(("bin", "FAILED: {}".format(e)))
-                errors.add("vertex_buffer", "vb{}".format(i), "GetBufferData", e)
-        else:
-            try:
-                data = bytes(controller.GetBufferData(rid, offset, 0))
-                if data:
-                    bin_.write_bytes(data)
-                    fields.append(("bin", "vertex_buffer_{}.bin ({} B, full buffer)".format(i, len(data))))
-                else:
-                    fields.append(("bin", "(empty)"))
-            except Exception as e:
-                fields.append(("bin", "FAILED: {}".format(e)))
-                errors.add("vertex_buffer", "vb{}".format(i), "GetBufferData", e)
+                fields.append(("bin", _bin_annotation(
+                    "vertex_buffer_{}.bin".format(i), len(data), size, offset)))
+            else:
+                fields.append(("bin", "(empty)"))
+        except Exception as e:
+            bin_.write_bytes(b"")
+            fields.append(("bin", "FAILED: {}".format(e)))
+            errors.add("vertex_buffer", "vb{}".format(i), "GetBufferData", e)
         _write_md(md, _md_header("vertex buffer at slot {}".format(i), fields))
 
     ib = getattr(ia, "indexBuffer", None)
@@ -2174,25 +2192,20 @@ def _export_input_assembly(out, controller, pipe, errors, counts,
             ("resource_id", rid),
             ("resource_name", _resource_name(res_lookup, rid, default="(unnamed)")),
             ("byte_offset_in_buffer", offset),
-            ("byte_size", size),
+            ("byte_size", _byte_size_field(size)),
             ("byte_stride", stride),
-            ("bin_starts_at_buffer_offset", 0),
-            ("is_pre_sliced", True),
         ]
         if rid is not None and not _is_null_id(rid):
-            # Mirror the vertex-buffer fallback: D3D11 frequently reports
-            # IB byte_size as 0; in that case fetch from offset to end of
-            # source buffer (size=0 in GetBufferData = full remainder).
-            # Without this the .bin never gets written and downstream
-            # mesh extraction has no indices to walk.
+            # D3D11 frequently reports IB byte_size as 0; fetch with
+            # size=0 in that case to get the full remainder of the
+            # source buffer. Without this fallback the .bin never gets
+            # written and downstream mesh extraction has no indices.
             try:
-                if size > 0:
-                    data = bytes(controller.GetBufferData(rid, offset, size))
-                    fields.append(("bin", "index_buffer.bin ({} B)".format(len(data))))
-                else:
-                    data = bytes(controller.GetBufferData(rid, offset, 0))
-                    fields.append(("bin", "index_buffer.bin ({} B, full buffer)".format(len(data))))
+                data = bytes(controller.GetBufferData(rid, offset,
+                                                     size if size > 0 else 0))
                 bin_.write_bytes(data)
+                fields.append(("bin", _bin_annotation(
+                    "index_buffer.bin", len(data), size, offset)))
             except Exception as e:
                 bin_.write_bytes(b"")
                 fields.append(("bin", "FAILED: {}".format(e)))

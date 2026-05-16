@@ -286,7 +286,7 @@ output. User-supplied `--out` is left alone.
 | Resource identity of any RT / VB / texture | the `resource_name` field in that file's `.md` |
 | Which sampler is paired with each texture | `<stage>/bindings.md` |
 | PNG color space for Unity import | `png_color_space` field in each texture / RT `.md` |
-| Vertex / index buffer raw bytes layout | the `byte_offset_in_buffer` / `is_pre_sliced` fields in `input_assembly/*.md` |
+| Vertex / index buffer raw bytes layout | the `byte_offset_in_buffer` field + the `bin:` source-coverage annotation in `input_assembly/*.md` |
 | Original (un-compiled) shader source | `<stage>/original_source/` (only when present) |
 | What failed in the export | `README.md` `## errors` section and any `STATUS: FAILED` headers |
 
@@ -322,9 +322,13 @@ output. User-supplied `--out` is left alone.
   OBJ channel is omitted with a note in `mesh.md`. Consumer decides
   how to interpret.
 - Underlying `vertex_buffer_<i>.bin` and `index_buffer.bin` are
-  **pre-sliced** -- byte 0 of the `.bin` is the first byte of the
-  draw's bound range. See the `bin_starts_at_buffer_offset` /
-  `is_pre_sliced` fields in the buffer `.md` files.
+  **pre-sliced** -- byte 0 of the `.bin` corresponds to
+  `byte_offset_in_buffer` of the source buffer. The `bin:` annotation
+  in each buffer `.md` spells the source-buffer range explicitly,
+  e.g. `vertex_buffer_0.bin (10970400 B; covers
+  source_buffer[5806816, 16777216))`. When D3D11 doesn't expose the
+  binding size the field shows `byte_size: unknown` and the
+  annotation says "API byteSize was 0, bin reads to end of buffer".
 
 ### Failure-handling contract
 
