@@ -1442,10 +1442,13 @@ def _export_texture(stage_dir, controller, gfxcap, desc, tex_desc,
 
     # EXR for analysis / DCC re-import / asset extraction; PNG sibling
     # for quick eyeball. See DESIGN.md "Texture output: 3-file rule".
+    type_cast = _view_type_cast(desc, gfxcap)
     exr_ok = _save_texture(controller, gfxcap, rid, exr, "EXR", errors,
-                           "texture_exr", "{}/{}{}".format(stage_short, prefix, slot))
+                           "texture_exr", "{}/{}{}".format(stage_short, prefix, slot),
+                           type_cast=type_cast)
     png_ok = _save_texture(controller, gfxcap, rid, png, "PNG", errors,
-                           "texture_png", "{}/{}{}".format(stage_short, prefix, slot))
+                           "texture_png", "{}/{}{}".format(stage_short, prefix, slot),
+                           type_cast=type_cast)
     fields.append(("exr", "OK" if exr_ok else "FAILED"))
     fields.append(("png", "OK" if png_ok else "FAILED"))
     _append_format_caveats(fields, _format_str(getattr(tex_desc, "format", None)))
@@ -1531,14 +1534,45 @@ def _exr_snorm_caveat(format_str):
     return ""
 
 
+def _view_type_cast(view_or_desc, gfxcap):
+    """Extract a non-typeless CompType from a view / descriptor's format
+    for use as SaveTexture.typeCast.
+
+    RenderDoc's SaveTexture defaults typeCast to Typeless, which makes
+    it interpret TYPELESS texture data as UNORM. That silently destroys
+    any TYPELESS texture the shader was reading as half-float / float
+    (LUTs, HDR buffers): an R16G16B16A16_TYPELESS half-float (1.0, 0,
+    0, 1) gets reinterpreted as four UNORM16s and dequantized to
+    (0.234, 0, 0, 0.234). Forwarding the *view's* compType -- which
+    IS the type the shader was reading -- fixes this without affecting
+    typed textures (the field is ignored when the source format isn't
+    typeless).
+
+    Returns None when no useful hint is available, in which case the
+    caller leaves typeCast at the RenderDoc default.
+    """
+    fmt = getattr(view_or_desc, "format", None)
+    if fmt is None:
+        return None
+    ct = getattr(fmt, "compType", None)
+    if ct is None:
+        return None
+    CT = getattr(gfxcap, "CompType", None)
+    if CT is not None and ct == getattr(CT, "Typeless", None):
+        return None
+    return ct
+
+
 def _save_texture(controller, gfxcap, resource_id, target_path, file_type,
-                  errors, group, target_name):
+                  errors, group, target_name, type_cast=None):
     if resource_id is None or _is_null_id(resource_id):
         errors.add(group, target_name, "null resource id")
         return False
     try:
         TS = gfxcap.TextureSave()
         TS.resourceId = resource_id
+        if type_cast is not None:
+            TS.typeCast = type_cast
         ft = getattr(gfxcap, "FileType", None)
         if ft is not None:
             mapped = getattr(ft, file_type, None)
@@ -2347,10 +2381,11 @@ def _export_om_target(om_dir, controller, gfxcap, view, errors, name, label,
     ]
     # EXR for analysis / DCC re-import / asset extraction; PNG sibling
     # for quick eyeball. See DESIGN.md "Texture output: 3-file rule".
+    type_cast = _view_type_cast(view, gfxcap)
     exr_ok = _save_texture(controller, gfxcap, rid, exr, "EXR", errors,
-                           prefix + "_exr", name)
+                           prefix + "_exr", name, type_cast=type_cast)
     png_ok = _save_texture(controller, gfxcap, rid, png, "PNG", errors,
-                           prefix + "_png", name)
+                           prefix + "_png", name, type_cast=type_cast)
     fields.append(("exr", "OK" if exr_ok else "FAILED"))
     fields.append(("png", "OK" if png_ok else "FAILED"))
     _append_format_caveats(fields, _format_str(getattr(view, "format", None)))
