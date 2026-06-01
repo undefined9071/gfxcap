@@ -345,6 +345,9 @@ README don't rot.
 eid action_id class flags api_call marker_path
 vs_name ps_name gs_name cs_name hs_name ds_name
 rt0_name rt0_size rt0_format n_rts dsv_name
+rt0_blend_color rt0_blend_alpha rt0_blend_mask
+depth_test depth_write depth_func
+stencil stencil_ref stencil_func cull
 num_indices num_instances dispatch_xyz indirect
 bind_fp hint
 ```
@@ -357,6 +360,16 @@ bind_fp hint
   per stage. For Unity / Unreal builds this is where keyword
   variants end up encoded, so a grep for `HG_ENABLE_MV` on the
   shader-name columns directly returns events using that variant.
+- The `rt0_blend_*` / `depth_*` / `stencil*` / `cull` block is the
+  per-event pipeline state surface for cross-EID queries. They
+  exist because the alternative — letting LLMs write ad-hoc Python
+  probes against the gfxcap module to answer "which EIDs have
+  additive blend" or "which draws disable depth write" — is the
+  exact failure mode this tool exists to remove. Encoding them
+  positionally in events.tsv lets the LLM compose arbitrary boolean
+  filters with plain awk, no module API knowledge required.
+  Values are intentionally compact ("y"/"n", short enum names,
+  src+op*dst form) so awk equality and regex match both work.
 - `bind_fp` is a 8-hex SHA1 prefix of (shader names + rt0 id +
   sorted SRV ids). Same `bind_fp` ≈ same kind of draw.
 - `hint` is a cheap heuristic tag (`fullscreen`, `instanced_batch`,
@@ -367,13 +380,16 @@ bind_fp hint
 
 `--shallow` skips `SetFrameEvent` entirely. The TSV still has class,
 flags, api_call, marker_path, counts, and the cheap hints — but the
-shader / RT / fingerprint columns are blank. Use shallow on captures
-where a first-pass triage is enough or where enriched cost is
-prohibitive (>50 K events).
+shader / RT / fingerprint / pipeline-state columns are blank. Use
+shallow on captures where a first-pass triage is enough or where
+enriched cost is prohibitive (>50 K events).
 
 Enriched (default) does `SetFrameEvent` once per indexable event and
-pulls bound shader / RT / SRV state via the same per-API pipe access
-helpers as `dump`. The cost is ~50–100 ms per event empirically.
+pulls bound shader / RT / SRV / blend / depth-stencil / raster state
+via the same per-API pipe access helpers as `dump`. The cost is
+~50–100 ms per event empirically; the pipeline-state extraction adds
+negligible cost on top because the pipe object is already fetched
+for the shader / RT columns.
 
 ### Filter flags (pre-write)
 

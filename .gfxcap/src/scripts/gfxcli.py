@@ -3274,6 +3274,86 @@ def _classify_hint(class_label, modifiers, num_indices, num_instances,
     return ""
 
 
+def _blend_expr(b):
+    """Compact 'src+op*dst' rendering of a BlendEquation. '' when None."""
+    if b is None:
+        return ""
+    return "{}+{}*{}".format(
+        _enum_str(getattr(b, "source", "?")),
+        _enum_str(getattr(b, "operation", "?")),
+        _enum_str(getattr(b, "destination", "?")))
+
+
+def _pipeline_state_brief(pipe):
+    """Extract compact pipeline state for inclusion in events.tsv.
+
+    Returns a dict with stable keys; values default to "" when state
+    isn't accessible (different APIs expose these via different attr
+    paths -- D3D11/D3D12 use outputMerger.blendState etc.; Vulkan/GL
+    don't, in which case the row carries empty cells rather than
+    crashing). Used by `gfxcli list` so LLM consumers can grep
+    cross-EID for blend / depth / stencil / cull patterns without
+    exploding every EID via `gfxcli dump`.
+
+    Compact value forms:
+        rt0_blend_color   "off" | "Src+Add*InvSrcAlpha" form
+        rt0_blend_alpha   "off" | "One+Add*Zero" form
+        rt0_blend_mask    hex digits, e.g. "F" / "7" / "0"
+        depth_test        "y" / "n"
+        depth_write       "y" / "n"
+        depth_func        short enum (e.g. "Less", "GreaterEqual")
+        stencil           "y" / "n"
+        stencil_ref       int as string
+        stencil_func      short enum (front face)
+        cull              "back" / "front" / "none" (lower-cased)
+    """
+    rec = {
+        "rt0_blend_color": "", "rt0_blend_alpha": "", "rt0_blend_mask": "",
+        "depth_test": "", "depth_write": "", "depth_func": "",
+        "stencil": "", "stencil_ref": "", "stencil_func": "",
+        "cull": "",
+    }
+    if pipe is None:
+        return rec
+    om = getattr(pipe, "outputMerger", None)
+    if om is not None:
+        bs = getattr(om, "blendState", None)
+        if bs is not None:
+            blends = getattr(bs, "blends", []) or []
+            if blends:
+                b0 = blends[0]
+                if bool(getattr(b0, "enabled", False)):
+                    rec["rt0_blend_color"] = _blend_expr(getattr(b0, "colorBlend", None))
+                    rec["rt0_blend_alpha"] = _blend_expr(getattr(b0, "alphaBlend", None))
+                else:
+                    rec["rt0_blend_color"] = "off"
+                    rec["rt0_blend_alpha"] = "off"
+                rec["rt0_blend_mask"] = "{:X}".format(int(getattr(b0, "writeMask", 0) or 0))
+        ds = getattr(om, "depthStencilState", None)
+        if ds is not None:
+            rec["depth_test"]  = "y" if bool(getattr(ds, "depthEnable", False)) else "n"
+            rec["depth_write"] = "y" if bool(getattr(ds, "depthWrites", False)) else "n"
+            df = _enum_str(getattr(ds, "depthFunction", ""))
+            if df and df != "?":
+                rec["depth_func"] = df
+            stencil_on = bool(getattr(ds, "stencilEnable", False))
+            rec["stencil"] = "y" if stencil_on else "n"
+            front = getattr(ds, "frontFace", None)
+            if front is not None:
+                rec["stencil_ref"] = str(int(getattr(front, "reference", 0) or 0))
+                sf = _enum_str(getattr(front, "function", ""))
+                if sf and sf != "?":
+                    rec["stencil_func"] = sf
+    rast = getattr(pipe, "rasterizer", None)
+    if rast is not None:
+        rs = getattr(rast, "state", None)
+        if rs is not None:
+            cull = _enum_str(getattr(rs, "cullMode", ""))
+            if cull and cull != "?":
+                rec["cull"] = cull.lower()
+    return rec
+
+
 # ---------- record assembly -------------------------------------------------
 
 def _make_event_record(a, parents, controller, gfxcap, res_lookup,
@@ -3302,6 +3382,11 @@ def _make_event_record(a, parents, controller, gfxcap, res_lookup,
         "hs_name": "", "ds_name": "",
         "rt0_name": "", "rt0_size": "", "rt0_format": "",
         "n_rts": 0, "dsv_name": "",
+        # pipeline state -- populated only in enriched mode (see below)
+        "rt0_blend_color": "", "rt0_blend_alpha": "", "rt0_blend_mask": "",
+        "depth_test": "", "depth_write": "", "depth_func": "",
+        "stencil": "", "stencil_ref": "", "stencil_func": "",
+        "cull": "",
         "num_indices":   int(getattr(a, "numIndices", 0) or 0),
         "num_instances": int(getattr(a, "numInstances", 0) or 0),
         "dispatch_xyz": "",
@@ -3364,6 +3449,9 @@ def _make_event_record(a, parents, controller, gfxcap, res_lookup,
     rt0_id = rt_ids[0] if rt_ids else None
     rec["bind_fp"] = _bind_fingerprint(snames, rt0_id, srv_ids)
 
+    # Cross-EID grep affordances: blend / depth / stencil / cull on rt0.
+    rec.update(_pipeline_state_brief(pipe))
+
     rec["hint"] = _classify_hint(cls, mods, rec["num_indices"],
                                  rec["num_instances"], n_rts,
                                  bool(dsv_id), rec["dispatch_xyz"])
@@ -3376,6 +3464,9 @@ _EVENTS_TSV_COLUMNS = [
     "eid", "action_id", "class", "flags", "api_call", "marker_path",
     "vs_name", "ps_name", "gs_name", "cs_name", "hs_name", "ds_name",
     "rt0_name", "rt0_size", "rt0_format", "n_rts", "dsv_name",
+    "rt0_blend_color", "rt0_blend_alpha", "rt0_blend_mask",
+    "depth_test", "depth_write", "depth_func",
+    "stencil", "stencil_ref", "stencil_func", "cull",
     "num_indices", "num_instances", "dispatch_xyz", "indirect",
     "bind_fp", "hint",
 ]
@@ -3673,6 +3764,15 @@ def _write_index_readme(out_dir, records, rdc, controller, shader_catalog,
         "| rt0_format | first RT format string |",
         "| n_rts | total bound RTs |",
         "| dsv_name | depth-stencil view engine name |",
+        "| rt0_blend_color | rt0 blend `src+op*dst` form, or `off` |",
+        "| rt0_blend_alpha | rt0 alpha-channel blend `src+op*dst`, or `off` |",
+        "| rt0_blend_mask | rt0 color write mask (hex digits) |",
+        "| depth_test / depth_write | `y` / `n` |",
+        "| depth_func | depth compare op (e.g. `Less`, `GreaterEqual`) |",
+        "| stencil | `y` / `n` (stencil test enabled) |",
+        "| stencil_ref | front-face stencil reference value (int) |",
+        "| stencil_func | front-face stencil compare op |",
+        "| cull | `back` / `front` / `none` |",
         "| num_indices / num_instances / dispatch_xyz | draw/dispatch counts |",
         "| indirect | `yes` if indirect call |",
         "| bind_fp | 8-hex hash of (shader names + rt0 + sorted SRV ids); same bind_fp == same kind of draw |",
@@ -3759,18 +3859,50 @@ def _write_index_readme(out_dir, records, rdc, controller, shader_catalog,
         "grep -P '\\tinstanced' EVENTS",
         "```",
         "",
+        "**By pipeline state** -- blend / depth / stencil / cull on rt0. "
+        "Column numbers: `rt0_blend_color=18`, `rt0_blend_alpha=19`, "
+        "`rt0_blend_mask=20`, `depth_test=21`, `depth_write=22`, "
+        "`depth_func=23`, `stencil=24`, `stencil_ref=25`, "
+        "`stencil_func=26`, `cull=27`.",
+        "",
+        "```sh",
+        "# transparency (alpha blend, premultiplied or not)",
+        "awk -F'\\t' 'NR>1 && $18 ~ /SrcAlpha|InvSrcAlpha/' EVENTS",
+        "",
+        "# additive blend (HDR particles, glow)",
+        "awk -F'\\t' 'NR>1 && $18 ~ /One\\+Add\\*One/' EVENTS",
+        "",
+        "# opaque draws (blend off)",
+        "awk -F'\\t' 'NR>1 && $18==\"off\"' EVENTS",
+        "",
+        "# depth test off (UI, sky, debug overlays)",
+        "awk -F'\\t' 'NR>1 && $21==\"n\"' EVENTS",
+        "",
+        "# depth read but no write (transparents, decals)",
+        "awk -F'\\t' 'NR>1 && $21==\"y\" && $22==\"n\"' EVENTS",
+        "",
+        "# stencil test with specific reference",
+        "awk -F'\\t' 'NR>1 && $24==\"y\" && $25==\"128\"' EVENTS",
+        "",
+        "# two-sided draws (hair, foliage, particles)",
+        "awk -F'\\t' 'NR>1 && $27==\"none\"' EVENTS",
+        "",
+        "# combine: transparent draws into a specific RT",
+        "awk -F'\\t' 'NR>1 && $18 ~ /SrcAlpha/ && $13 ~ /MainHDR/' EVENTS",
+        "```",
+        "",
         "**Cluster: find one representative per bind-fingerprint** "
         "(deduplicates 'same kind of draw'):",
         "",
         "```sh",
         "# print first eid for each unique bind_fp",
-        "awk -F'\\t' 'NR>1 && !seen[$22]++ {print $1, $22, $7, $13}' EVENTS",
+        "awk -F'\\t' 'NR>1 && !seen[$32]++ {print $1, $32, $7, $13}' EVENTS",
         "```",
         "",
         "**Find fullscreen / post-process candidates**:",
         "",
         "```sh",
-        "awk -F'\\t' '$23==\"fullscreen\"' EVENTS",
+        "awk -F'\\t' '$33==\"fullscreen\"' EVENTS",
         "```",
         "",
         "## files",

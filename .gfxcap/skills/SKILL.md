@@ -7,8 +7,11 @@ description: >
   - `gfxcli list` walks every event in the capture and writes a grep-friendly
     TSV index plus Markdown views. Search by shader name (Unity / Unreal
     keyword variants surface verbatim in the resource name), by debug
-    marker / pass, by render target, by bind-fingerprint cluster, or by
-    cheap heuristics like fullscreen / compute / shadow.
+    marker / pass, by render target, by bind-fingerprint cluster, by
+    pipeline state (blend / depth / stencil / cull on rt0), or by cheap
+    heuristics like fullscreen / compute / shadow. **Every per-event
+    grep-needable property is a column in events.tsv** -- the LLM should
+    never need to write a Python probe to survey state across EIDs.
   - `gfxcli dump` exports a single EID's full pipeline state — shaders
     (DXBC + asm + decompiled HLSL + embedded original source if present),
     textures, cbuffers, IA, OM, rasterizer — into a Markdown bundle that
@@ -17,7 +20,10 @@ description: >
   Trigger phrases for list: "find the draw that uses X", "which EID
   renders to Y", "list events", "search the capture", "events matching",
   "show me all draws / dispatches", "compile flags", "shader variants",
-  "which variants are used", "what passes are in this frame".
+  "which variants are used", "what passes are in this frame", "which
+  draws have additive blend / alpha blend", "find draws with depth test
+  off", "stencil ref = N", "draws with cull = front", "post-process
+  draws".
 
   Trigger phrases for dump: "export this draw", "dump EID", "extract
   shader", "decompile this draw", "renderdoc export", "gfxcap export",
@@ -132,10 +138,23 @@ state; expect ~minutes for 10k-event captures.
 | `rt0_format` | first RT format string |
 | `n_rts` | total bound render targets |
 | `dsv_name` | depth-stencil view engine name |
+| `rt0_blend_color` | rt0 color-channel blend as `src+op*dst` (e.g. `Src+Add*InvSrc`), or `off` when blending is disabled. |
+| `rt0_blend_alpha` | rt0 alpha-channel blend, same form. |
+| `rt0_blend_mask` | rt0 color write mask, hex digits (`F` = RGBA, `7` = RGB, `0` = nothing). |
+| `depth_test` | `y` / `n` — depth-test enabled. |
+| `depth_write` | `y` / `n` — depth-write enabled. |
+| `depth_func` | depth compare op (`Less`, `LessEqual`, `Greater`, `Equal`, `Always`, ...). |
+| `stencil` | `y` / `n` — stencil test enabled. |
+| `stencil_ref` | front-face stencil reference value, integer. |
+| `stencil_func` | front-face stencil compare op (`Always`, `Equal`, `Less`, ...). |
+| `cull` | `back` / `front` / `none`. |
 | `num_indices`, `num_instances`, `dispatch_xyz` | draw / dispatch counts |
 | `indirect` | `yes` if indirect call |
 | `bind_fp` | 8-hex hash of (all shader names + rt0 id + sorted SRV ids). **Same `bind_fp` = same kind of draw**. Cluster all draws by this column to dedupe a frame. |
 | `hint` | cheap heuristic: `fullscreen` (3/4/6 indices, 1 instance, no DSV), `instanced_batch` (>=100 instances), `compute` (dispatch with no RT), `clear`, `copy`, `resolve`, `gen_mips`, `indirect`. Empty when no rule fires. |
+
+Pipeline-state columns (`rt0_blend_*` through `cull`) are populated only
+in enriched mode; `--shallow` leaves them blank.
 
 ### Grep recipes
 
@@ -183,17 +202,56 @@ grep -P '\tinstanced' EVENTS
 grep -P '\tindirect' EVENTS
 ```
 
+**By pipeline state** -- blend / depth / stencil / cull. These are the
+queries that historically required a Python probe; they're now plain
+awk against the columns. Column numbers: `rt0_blend_color=18`,
+`rt0_blend_alpha=19`, `rt0_blend_mask=20`, `depth_test=21`,
+`depth_write=22`, `depth_func=23`, `stencil=24`, `stencil_ref=25`,
+`stencil_func=26`, `cull=27`.
+
+```sh
+# all transparency draws (alpha blend, premultiplied or not)
+awk -F'\t' 'NR>1 && $18 ~ /SrcAlpha|InvSrcAlpha/' EVENTS
+
+# additive blend (HDR particles, glow, fire)
+awk -F'\t' 'NR>1 && $18 ~ /One\+Add\*One/' EVENTS
+
+# opaque-only (blend disabled)
+awk -F'\t' 'NR>1 && $18=="off"' EVENTS
+
+# depth-test disabled (UI, debug, sky)
+awk -F'\t' 'NR>1 && $21=="n"' EVENTS
+
+# depth-test on but no depth write (transparents, decals)
+awk -F'\t' 'NR>1 && $21=="y" && $22=="n"' EVENTS
+
+# stencil test with a specific reference value (e.g. character mask = 128)
+awk -F'\t' 'NR>1 && $24=="y" && $25=="128"' EVENTS
+
+# stencil compare op "Equal" (mask read pass)
+awk -F'\t' 'NR>1 && $26=="Equal"' EVENTS
+
+# two-sided draws (no culling -- hair, foliage, particles)
+awk -F'\t' 'NR>1 && $27=="none"' EVENTS
+
+# back-face culled (standard opaque geometry)
+awk -F'\t' 'NR>1 && $27=="back"' EVENTS
+
+# combine pipeline-state filters with shader / RT filters
+awk -F'\t' 'NR>1 && $18 ~ /SrcAlpha/ && $13 ~ /MainHDR/' EVENTS
+```
+
 **Cluster: one representative per bind-fingerprint** (deduplicate the
 "same kind of draw"):
 
 ```sh
-awk -F'\t' 'NR>1 && !seen[$22]++ {print $1, $22, $7, $13}' EVENTS
+awk -F'\t' 'NR>1 && !seen[$32]++ {print $1, $32, $7, $13}' EVENTS
 ```
 
 **Fullscreen / post-process candidates**:
 
 ```sh
-awk -F'\t' '$23=="fullscreen"' EVENTS
+awk -F'\t' '$33=="fullscreen"' EVENTS
 ```
 
 ### Exit codes
@@ -357,6 +415,10 @@ not exist on the GPU".
 | "Give me everything about EID N" | `dump` |
 | "What variants of shader X exist in this frame?" | `list`, then `shaders.tsv` |
 | "Pick a representative draw for each cluster" | `list`, then `bind_fp` dedupe (see README recipe) |
+| "Which draws use additive / alpha blend / no blend" | `list`, then awk on `rt0_blend_color` |
+| "Find draws with depth test off / no depth write" | `list`, then awk on `depth_test` / `depth_write` |
+| "Stencil test = N / specific compare op" | `list`, then awk on `stencil_ref` / `stencil_func` |
+| "Two-sided / no-cull draws" | `list`, then awk on `cull` |
 | "I need the textures and cbuffer values" | `dump` |
 | "Survey what's in this capture" | `list` (read its README first) |
 
