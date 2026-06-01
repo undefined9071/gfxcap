@@ -143,10 +143,10 @@ state; expect ~minutes for 10k-event captures.
 | `rt0_blend_mask` | rt0 color write mask, hex digits (`F` = RGBA, `7` = RGB, `0` = nothing). |
 | `depth_test` | `y` / `n` — depth-test enabled. |
 | `depth_write` | `y` / `n` — depth-write enabled. |
-| `depth_func` | depth compare op (`Less`, `LessEqual`, `Greater`, `Equal`, `Always`, ...). |
+| `depth_func` | depth compare op (`Less`, `LessEqual`, `Greater`, `Equal`, `Always`, ...). **Empty when `depth_test=n`** — the API field is stale (carries the create-time value) when depth-test is disabled, so it is intentionally blanked here to keep `$23=="Less"`-style queries free of false positives. |
 | `stencil` | `y` / `n` — stencil test enabled. |
-| `stencil_ref` | front-face stencil reference value, integer. |
-| `stencil_func` | front-face stencil compare op (`Always`, `Equal`, `Less`, ...). |
+| `stencil_ref` | front-face stencil reference value, integer. **Empty when `stencil=n`** (same gating rationale as `depth_func`). |
+| `stencil_func` | front-face stencil compare op (`Always`, `Equal`, `Less`, ...). **Empty when `stencil=n`**. |
 | `cull` | `back` / `front` / `none`. |
 | `num_indices`, `num_instances`, `dispatch_xyz` | draw / dispatch counts |
 | `indirect` | `yes` if indirect call |

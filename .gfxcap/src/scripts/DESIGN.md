@@ -370,6 +370,13 @@ bind_fp hint
   filters with plain awk, no module API knowledge required.
   Values are intentionally compact ("y"/"n", short enum names,
   src+op*dst form) so awk equality and regex match both work.
+- **Gating rule**: `depth_func` is blanked when `depth_test=n`, and
+  `stencil_ref` / `stencil_func` are blanked when `stencil=n`. The
+  underlying API keeps these fields alive at their create-time value
+  even when the test is disabled, so emitting them unconditionally
+  would mean an `$23=="Less"` or `$25=="128"` awk match against a
+  draw whose depth/stencil isn't actually doing anything — exactly
+  the silent false-positive class that wastes LLM analysis time.
 - `bind_fp` is a 8-hex SHA1 prefix of (shader names + rt0 id +
   sorted SRV ids). Same `bind_fp` ≈ same kind of draw.
 - `hint` is a cheap heuristic tag (`fullscreen`, `instanced_batch`,

@@ -3301,10 +3301,15 @@ def _pipeline_state_brief(pipe):
         rt0_blend_mask    hex digits, e.g. "F" / "7" / "0"
         depth_test        "y" / "n"
         depth_write       "y" / "n"
-        depth_func        short enum (e.g. "Less", "GreaterEqual")
+        depth_func        short enum (e.g. "Less", "GreaterEqual");
+                          empty when depth_test=n (the API field still
+                          carries the previous draw's value when the
+                          test is disabled, which would cause false
+                          positives in awk queries like $23=="Less")
         stencil           "y" / "n"
-        stencil_ref       int as string
-        stencil_func      short enum (front face)
+        stencil_ref       int as string; empty when stencil=n (same
+                          rationale: API field is stale when off)
+        stencil_func      short enum (front face); empty when stencil=n
         cull              "back" / "front" / "none" (lower-cased)
     """
     rec = {
@@ -3331,19 +3336,30 @@ def _pipeline_state_brief(pipe):
                 rec["rt0_blend_mask"] = "{:X}".format(int(getattr(b0, "writeMask", 0) or 0))
         ds = getattr(om, "depthStencilState", None)
         if ds is not None:
-            rec["depth_test"]  = "y" if bool(getattr(ds, "depthEnable", False)) else "n"
+            depth_on = bool(getattr(ds, "depthEnable", False))
+            rec["depth_test"]  = "y" if depth_on else "n"
             rec["depth_write"] = "y" if bool(getattr(ds, "depthWrites", False)) else "n"
-            df = _enum_str(getattr(ds, "depthFunction", ""))
-            if df and df != "?":
-                rec["depth_func"] = df
+            # depth_func is only emitted when depth_test=y -- the API
+            # keeps the field's create-time value alive even when the
+            # test is disabled, so emitting it unconditionally would
+            # make `$23=="Less"` match draws with depth-test off but a
+            # stale Less left in the state object.
+            if depth_on:
+                df = _enum_str(getattr(ds, "depthFunction", ""))
+                if df and df != "?":
+                    rec["depth_func"] = df
             stencil_on = bool(getattr(ds, "stencilEnable", False))
             rec["stencil"] = "y" if stencil_on else "n"
-            front = getattr(ds, "frontFace", None)
-            if front is not None:
-                rec["stencil_ref"] = str(int(getattr(front, "reference", 0) or 0))
-                sf = _enum_str(getattr(front, "function", ""))
-                if sf and sf != "?":
-                    rec["stencil_func"] = sf
+            # stencil_ref / stencil_func: same gating rationale -- the
+            # front-face struct holds reference / function values even
+            # when stencilEnable=False, so leave them blank in that case.
+            if stencil_on:
+                front = getattr(ds, "frontFace", None)
+                if front is not None:
+                    rec["stencil_ref"] = str(int(getattr(front, "reference", 0) or 0))
+                    sf = _enum_str(getattr(front, "function", ""))
+                    if sf and sf != "?":
+                        rec["stencil_func"] = sf
     rast = getattr(pipe, "rasterizer", None)
     if rast is not None:
         rs = getattr(rast, "state", None)
@@ -3768,10 +3784,10 @@ def _write_index_readme(out_dir, records, rdc, controller, shader_catalog,
         "| rt0_blend_alpha | rt0 alpha-channel blend `src+op*dst`, or `off` |",
         "| rt0_blend_mask | rt0 color write mask (hex digits) |",
         "| depth_test / depth_write | `y` / `n` |",
-        "| depth_func | depth compare op (e.g. `Less`, `GreaterEqual`) |",
+        "| depth_func | depth compare op (e.g. `Less`, `GreaterEqual`). Empty when `depth_test=n` (the API field carries a stale value when the test is disabled). |",
         "| stencil | `y` / `n` (stencil test enabled) |",
-        "| stencil_ref | front-face stencil reference value (int) |",
-        "| stencil_func | front-face stencil compare op |",
+        "| stencil_ref | front-face stencil reference value (int). Empty when `stencil=n`. |",
+        "| stencil_func | front-face stencil compare op. Empty when `stencil=n`. |",
         "| cull | `back` / `front` / `none` |",
         "| num_indices / num_instances / dispatch_xyz | draw/dispatch counts |",
         "| indirect | `yes` if indirect call |",
