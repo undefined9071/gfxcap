@@ -342,9 +342,9 @@ void LibraryHooks::RegisterFunctionHook(const char *libraryName, const FunctionH
       // requires `<input> <-dxbc|-dxil|-spirv> [output.hlsl]` -- without the
       // flag the exe just prints its usage and exits 0 with no output.
       struct { ShaderEncoding in; const char *name; const char *args; } variants[] = {
-        { ShaderEncoding::DXBC,  "gfxcap: HLSL Decompiler (DXBC)",   "-dxbc {input_file}"   },
-        { ShaderEncoding::DXIL,  "gfxcap: HLSL Decompiler (DXIL)",   "-dxil {input_file}"   },
-        { ShaderEncoding::SPIRV, "gfxcap: HLSL Decompiler (SPIR-V)", "-spirv {input_file}" },
+        { ShaderEncoding::DXBC,  "gfxcap: HLSL Decompiler (DXBC)",   "{input_file} -dxbc"   },
+        { ShaderEncoding::DXIL,  "gfxcap: HLSL Decompiler (DXIL)",   "{input_file} -dxil"   },
+        { ShaderEncoding::SPIRV, "gfxcap: HLSL Decompiler (SPIR-V)", "{input_file} -spirv" },
       };
       for(const auto &v : variants)
       {
