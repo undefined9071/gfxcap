@@ -273,10 +273,12 @@ void LibraryHooks::RegisterFunctionHook(const char *libraryName, const FunctionH
     # The plugin lives at <exe-dir>/plugins/hlsl-decompiler/HLSLDecompiler.bat
     # (workflow stages it from .gfxcap/3rdparty/hlsl-decompiler). The .bat
     # writes HLSL to stdout, so we register it as KnownShaderTool::Unknown
-    # with args="{input_file}" -- because there's no {output_file}
-    # placeholder, ShaderProcessingTool::RunTool falls into its
-    # stdout-as-output path. Three entries (DXBC / DXIL / SPIR-V inputs)
-    # so the GUI can decompile any shader format the capture exposes.
+    # with no {output_file} placeholder, so ShaderProcessingTool::RunTool
+    # falls into its stdout-as-output path. Three entries (DXBC / DXIL /
+    # SPIR-V inputs) so the GUI can decompile any shader format the capture
+    # exposes; each variant pins its own -dxbc/-dxil/-spirv flag in args
+    # because HLSLDecompiler.exe requires the format flag explicitly (omit
+    # it and the exe prints usage and exits 0 with no output).
     #
     # PORTABILITY: the bundle must work no matter where the user extracts
     # it. PersistantConfig (~/AppData/...) is shared across all gfxcap
@@ -335,10 +337,14 @@ void LibraryHooks::RegisterFunctionHook(const char *libraryName, const FunctionH
 
     if(bundlePresent)
     {
-      struct { ShaderEncoding in; const char *name; } variants[] = {
-        { ShaderEncoding::DXBC,  "gfxcap: HLSL Decompiler (DXBC)"   },
-        { ShaderEncoding::DXIL,  "gfxcap: HLSL Decompiler (DXIL)"   },
-        { ShaderEncoding::SPIRV, "gfxcap: HLSL Decompiler (SPIR-V)" },
+      // Each variant carries its own -dxbc/-dxil/-spirv flag in args. The
+      // .bat is a bare `%*` pass-through to HLSLDecompiler.exe, which
+      // requires `<input> <-dxbc|-dxil|-spirv> [output.hlsl]` -- without the
+      // flag the exe just prints its usage and exits 0 with no output.
+      struct { ShaderEncoding in; const char *name; const char *args; } variants[] = {
+        { ShaderEncoding::DXBC,  "gfxcap: HLSL Decompiler (DXBC)",   "-dxbc {input_file}"   },
+        { ShaderEncoding::DXIL,  "gfxcap: HLSL Decompiler (DXIL)",   "-dxil {input_file}"   },
+        { ShaderEncoding::SPIRV, "gfxcap: HLSL Decompiler (SPIR-V)", "-spirv {input_file}" },
       };
       for(const auto &v : variants)
       {
@@ -346,7 +352,7 @@ void LibraryHooks::RegisterFunctionHook(const char *libraryName, const FunctionH
         s.tool = KnownShaderTool::Unknown;
         s.name = v.name;
         s.executable = hlslDecompPath;
-        s.args = "{input_file}";
+        s.args = v.args;
         s.input = v.in;
         s.output = ShaderEncoding::HLSL;
         ShaderProcessors.push_back(s);
