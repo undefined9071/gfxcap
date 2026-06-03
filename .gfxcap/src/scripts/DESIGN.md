@@ -313,6 +313,10 @@ Example:
   events.tsv             one row per drawable event; tab-separated.
                          Authoritative artifact -- everything else is
                          a convenience view of this data.
+  resource_io.tsv        long-format dataflow join table: one row per
+                         (event, bound resource). The grep target for
+                         "who reads/writes resource X" (both directions)
+                         and "full I/O of event N".
   events.md              same data grouped by marker_path
                          (visual skim)
   shaders.tsv            unique-shader catalogue
@@ -370,18 +374,53 @@ bind_fp hint
   filters with plain awk, no module API knowledge required.
   Values are intentionally compact ("y"/"n", short enum names,
   src+op*dst form) so awk equality and regex match both work.
-- **Gating rule**: `depth_func` is blanked when `depth_test=n`, and
-  `stencil_ref` / `stencil_func` are blanked when `stencil=n`. The
-  underlying API keeps these fields alive at their create-time value
-  even when the test is disabled, so emitting them unconditionally
-  would mean an `$23=="Less"` or `$25=="128"` awk match against a
-  draw whose depth/stencil isn't actually doing anything — exactly
-  the silent false-positive class that wastes LLM analysis time.
+  `cull` is the lower-cased cull-mode enum: `back` / `front` /
+  `nocull` / `frontandback` (it is `nocull`, not `none`).
+- **Gating rules** (all guard against stale-state false positives —
+  the silent failure class that wastes LLM analysis time):
+  - The whole `rt0_blend_*` .. `cull` block is emitted only for the
+    rasterizing classes (`draw`, `mesh_dispatch`). A compute dispatch
+    / clear / copy carries whatever OM + raster state was bound, which
+    doesn't describe what it does, so those rows are blank.
+  - Within a draw, `depth_func` is blanked when `depth_test=n`, and
+    `stencil_ref` / `stencil_func` when `stencil=n`. The API keeps
+    these fields at their create-time value even when the test is off,
+    so emitting them unconditionally would make `$23=="Less"` or
+    `$25=="128"` match a draw whose depth/stencil isn't doing anything.
 - `bind_fp` is a 8-hex SHA1 prefix of (shader names + rt0 id +
   sorted SRV ids). Same `bind_fp` ≈ same kind of draw.
 - `hint` is a cheap heuristic tag (`fullscreen`, `instanced_batch`,
   `compute`, `shadow`?, ...). False positives are worse than
   silence, so the rules are conservative.
+
+### resource_io.tsv schema
+
+events.tsv is one row per event and can only afford a single
+representative resource column (`rt0_*`). Dataflow questions —
+"which events read texture X", "what does this draw consume", "find
+the producer of this buffer then its consumers" — need the full
+many-to-many (event ↔ resource) relation. That's a separate
+long-format table rather than ever-wider events.tsv rows.
+
+```
+eid  direction  kind  resource_id  resource_name  dims
+```
+
+- `direction`: `read` (SRV), `write` (RT / DSV), `readwrite` (UAV).
+- `kind`: `srv` / `uav` / `rt` / `dsv`.
+- One row per (event, bound resource); de-duplicated within an event.
+- Reads/UAVs come from the unified descriptor-access API, writes from
+  `outputMerger` — both API-agnostic, so this works on D3D11 / D3D12 /
+  Vulkan. The descriptor walk is shared with the bind-fingerprint, so
+  there's no extra per-event replay cost.
+- Populated in enriched mode only (header-only in `--shallow`).
+
+This subsumes the write-side data in render_targets.md and adds the
+read side, which is what makes producer→consumer tracing a plain
+grep: `$4==<id> && $2=="write"` finds the producer, `$4==<id> &&
+$2=="read"` finds every consumer. It is the first-class replacement
+for what used to require an ad-hoc `srv_finder` / `graph_probe`
+script against the module API.
 
 ### Shallow vs enriched
 

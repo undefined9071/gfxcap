@@ -23,7 +23,9 @@ description: >
   "which variants are used", "what passes are in this frame", "which
   draws have additive blend / alpha blend", "find draws with depth test
   off", "stencil ref = N", "draws with cull = front", "post-process
-  draws".
+  draws", "which EIDs read / write resource X", "what does this draw
+  read", "who consumes this buffer / texture", "trace the dataflow
+  between passes", "producer / consumer of a resource".
 
   Trigger phrases for dump: "export this draw", "dump EID", "extract
   shader", "decompile this draw", "renderdoc export", "gfxcap export",
@@ -105,6 +107,14 @@ state; expect ~minutes for 10k-event captures.
   events.tsv             ← the authoritative artifact. One row per
                            drawable event. Tab-separated, header in
                            row 1. Run grep / awk against this.
+  resource_io.tsv        ← dataflow join table. One row per
+                           (event, bound resource): direction
+                           (read/write/readwrite), kind, resource id,
+                           name, dims. Grep this to answer "which EIDs
+                           read/write resource X" (both directions) and
+                           "what is the full I/O of EID N" -- the
+                           producer/consumer questions events.tsv's
+                           single rt0 column can't.
   events.md              ← same data as events.tsv, grouped by
                            marker_path. Use for skimming pass
                            structure visually.
@@ -147,14 +157,18 @@ state; expect ~minutes for 10k-event captures.
 | `stencil` | `y` / `n` — stencil test enabled. |
 | `stencil_ref` | front-face stencil reference value, integer. **Empty when `stencil=n`** (same gating rationale as `depth_func`). |
 | `stencil_func` | front-face stencil compare op (`Always`, `Equal`, `Less`, ...). **Empty when `stencil=n`**. |
-| `cull` | `back` / `front` / `none`. |
+| `cull` | lower-cased cull mode: `back` / `front` / `nocull` / `frontandback` (the raw enum name; note it is `nocull`, not `none`). |
 | `num_indices`, `num_instances`, `dispatch_xyz` | draw / dispatch counts |
 | `indirect` | `yes` if indirect call |
 | `bind_fp` | 8-hex hash of (all shader names + rt0 id + sorted SRV ids). **Same `bind_fp` = same kind of draw**. Cluster all draws by this column to dedupe a frame. |
 | `hint` | cheap heuristic: `fullscreen` (3/4/6 indices, 1 instance, no DSV), `instanced_batch` (>=100 instances), `compute` (dispatch with no RT), `clear`, `copy`, `resolve`, `gen_mips`, `indirect`. Empty when no rule fires. |
 
 Pipeline-state columns (`rt0_blend_*` through `cull`) are populated only
-in enriched mode; `--shallow` leaves them blank.
+in enriched mode **and only for the rasterizing classes** (`draw`,
+`mesh_dispatch`). For `dispatch` / `clear` / `copy` / etc. they are
+blank, because the bound blend / depth / cull state doesn't describe
+what those events actually do. `--shallow` leaves them blank for every
+class.
 
 ### Grep recipes
 
@@ -232,7 +246,7 @@ awk -F'\t' 'NR>1 && $24=="y" && $25=="128"' EVENTS
 awk -F'\t' 'NR>1 && $26=="Equal"' EVENTS
 
 # two-sided draws (no culling -- hair, foliage, particles)
-awk -F'\t' 'NR>1 && $27=="none"' EVENTS
+awk -F'\t' 'NR>1 && $27=="nocull"' EVENTS
 
 # back-face culled (standard opaque geometry)
 awk -F'\t' 'NR>1 && $27=="back"' EVENTS
@@ -253,6 +267,40 @@ awk -F'\t' 'NR>1 && !seen[$32]++ {print $1, $32, $7, $13}' EVENTS
 ```sh
 awk -F'\t' '$33=="fullscreen"' EVENTS
 ```
+
+### resource_io.tsv -- dataflow (who reads / writes what)
+
+`events.tsv` carries only the first render target (`rt0_*`). To trace
+the **full** input/output set of an event, or to answer the reverse
+question "which events touch resource X", use `resource_io.tsv`: a
+long-format join table with one row per (event, bound resource).
+
+Columns: `eid`, `direction` (`read` = SRV, `write` = RT/DSV,
+`readwrite` = UAV), `kind` (`srv`/`uav`/`rt`/`dsv`), `resource_id`,
+`resource_name`, `dims` (`WxH` for textures, blank otherwise).
+
+```sh
+# IO = your resource_io.tsv path
+
+# CONSUMERS: every event that reads resource 'ResourceId::28255' as SRV
+awk -F'\t' '$4=="ResourceId::28255" && $2=="read"' IO
+
+# PRODUCERS: every event that writes a given render target
+awk -F'\t' '$4=="ResourceId::7496" && $2=="write"' IO
+
+# FULL I/O of one event (what EID 1505 reads and writes)
+awk -F'\t' '$1=="1505"' IO
+
+# trace a buffer's whole lifetime (reads + writes + UAV), any direction
+awk -F'\t' '$4=="ResourceId::18904"' IO
+
+# find a resource id by name first, then pivot to its EIDs
+grep -F 'AnimationTexture' IO | cut -f4 | sort -u
+```
+
+Typical dataflow trace: find the EID that *writes* a buffer
+(producer), then grep its id with `$2=="read"` to find every
+*consumer* downstream -- the dependency edge between two passes.
 
 ### Exit codes
 
@@ -319,6 +367,10 @@ output. User-supplied `--out` is left alone.
     constant_buffer_b<n>_vars.tsv     full variable table when > 128
                                       entries (TSV, grep-friendly)
     texture_t<n>.exr + .png + .md
+    texture_t<n>_slice<k>.png            per-array-slice PNGs, only when
+                                      the bound view spans >1 slice
+                                      (texture arrays / cubemaps); capped
+                                      at 16 slices
     buffer_t<n>.bin + .md
     sampler_s<n>.md
     uav_u<n>.{exr | bin, png?, md}
@@ -343,6 +395,8 @@ output. User-supplied `--out` is left alone.
 | Which pass this draw belongs to | `README.md` metadata `marker_path` row |
 | Resource identity of any RT / VB / texture | the `resource_name` field in that file's `.md` |
 | Which sampler is paired with each texture | `<stage>/bindings.md` |
+| Value range of a texture / RT (HDR, LUT, depth) | `value_min_rgba` / `value_max_rgba` fields in that texture's `.md` (GetMinMax over mip0/slice0; absent when the format doesn't support it) |
+| Individual slices of a texture array / cubemap | `texture_t<n>_slice<k>.png` next to the `.md` (see `array_slices_exported` field) |
 | PNG color space for Unity import | `png_color_space` field in each texture / RT `.md` |
 | Vertex / index buffer raw bytes layout | the `byte_offset_in_buffer` field + the `bin:` source-coverage annotation in `input_assembly/*.md` |
 | Original (un-compiled) shader source | `<stage>/original_source/` (only when present) |
@@ -419,6 +473,10 @@ not exist on the GPU".
 | "Find draws with depth test off / no depth write" | `list`, then awk on `depth_test` / `depth_write` |
 | "Stencil test = N / specific compare op" | `list`, then awk on `stencil_ref` / `stencil_func` |
 | "Two-sided / no-cull draws" | `list`, then awk on `cull` |
+| "Which EIDs read / write resource X" | `list`, then awk on `resource_io.tsv` |
+| "Full input/output set of one draw" | `list` + `resource_io.tsv` (`$1==EID`), or `dump` for the deep version |
+| "Trace producer → consumer between passes" | `list`, then `resource_io.tsv` (write side → read side of same id) |
+| "Value range / slices of a texture" | `dump`, read `value_*_rgba` + `*_slice<k>.png` |
 | "I need the textures and cbuffer values" | `dump` |
 | "Survey what's in this capture" | `list` (read its README first) |
 

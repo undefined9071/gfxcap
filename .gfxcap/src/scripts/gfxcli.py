@@ -1451,6 +1451,9 @@ def _export_texture(stage_dir, controller, gfxcap, desc, tex_desc,
                            type_cast=type_cast)
     fields.append(("exr", "OK" if exr_ok else "FAILED"))
     fields.append(("png", "OK" if png_ok else "FAILED"))
+    _augment_texture_md(fields, controller, gfxcap, desc, rid, type_cast,
+                        stage_dir, "{}{}".format(prefix, slot), errors,
+                        "texture_slice")
     _append_format_caveats(fields, _format_str(getattr(tex_desc, "format", None)))
 
     _write_md(md, _md_header(title, fields))
@@ -1563,8 +1566,119 @@ def _view_type_cast(view_or_desc, gfxcap):
     return ct
 
 
+def _fmt_float_vec(vals):
+    """Compact float-vector rendering for .md fields, e.g. (1, 0.5, 0, 1)."""
+    return "(" + ", ".join("{:.4g}".format(x) for x in vals) + ")"
+
+
+def _texture_minmax(controller, gfxcap, resource_id, type_cast):
+    """Best-effort GetMinMax over mip 0 / slice 0. Returns (min_list,
+    max_list) of up to 4 floats, or None when unsupported (e.g. depth
+    targets, some typeless formats). Non-fatal -- the caller just omits
+    the value range when None. Uses the same compType as the EXR/PNG
+    save so the reported range matches what the dumped image contains."""
+    if resource_id is None or _is_null_id(resource_id):
+        return None
+    try:
+        sub = gfxcap.Subresource()
+    except Exception:
+        return None
+    for attr in ("mip", "slice", "sample"):
+        try:
+            setattr(sub, attr, 0)
+        except Exception:
+            pass
+    comp = type_cast
+    if comp is None:
+        CT = getattr(gfxcap, "CompType", None)
+        comp = getattr(CT, "Float", None) if CT is not None else None
+    try:
+        if comp is not None:
+            res = controller.GetMinMax(resource_id, sub, comp)
+        else:
+            res = controller.GetMinMax(resource_id, sub)
+    except Exception:
+        return None
+    if not res:
+        return None
+    try:
+        mn, mx = res
+    except Exception:
+        return None
+
+    def _f4(v):
+        fv = getattr(v, "floatValue", None)
+        if fv is None:
+            return []
+        try:
+            return [float(x) for x in list(fv)[:4]]
+        except Exception:
+            return []
+
+    fmn, fmx = _f4(mn), _f4(mx)
+    if not fmn and not fmx:
+        return None
+    return fmn, fmx
+
+
+def _texture_save_supports_slice(gfxcap):
+    """True iff TextureSave.slice.sliceIndex is settable in this build.
+    Checked once before per-slice export so we never silently re-emit
+    slice 0 N times when the binding isn't writable."""
+    try:
+        ts = gfxcap.TextureSave()
+        ts.slice.sliceIndex = 1
+        return int(getattr(ts.slice, "sliceIndex", -1)) == 1
+    except Exception:
+        return False
+
+
+# Per-texture cap on how many array slices we dump as separate PNGs, so a
+# huge texture array (e.g. a 2048-slice atlas) can't explode the output.
+_SLICE_EXPORT_CAP = 16
+
+
+def _augment_texture_md(fields, controller, gfxcap, view, rid, type_cast,
+                        out_dir, base_name, errors, group):
+    """Append value-range (GetMinMax) and per-array-slice PNG exports to a
+    texture / render-target .md. Both are best-effort and never fail the
+    overall export."""
+    mm = _texture_minmax(controller, gfxcap, rid, type_cast)
+    if mm is not None:
+        fmn, fmx = mm
+        if fmn:
+            fields.append(("value_min_rgba", _fmt_float_vec(fmn)))
+        if fmx:
+            fields.append(("value_max_rgba", _fmt_float_vec(fmx)))
+
+    try:
+        n_slices = int(getattr(view, "numSlices", 0) or 0)
+    except Exception:
+        n_slices = 0
+    if n_slices > 1 and _texture_save_supports_slice(gfxcap):
+        try:
+            first_slice = int(getattr(view, "firstSlice", 0) or 0)
+        except Exception:
+            first_slice = 0
+        emit = min(n_slices, _SLICE_EXPORT_CAP)
+        ok = 0
+        for k in range(emit):
+            s = first_slice + k
+            sp = out_dir / "{}_slice{}.png".format(base_name, s)
+            if _save_texture(controller, gfxcap, rid, sp, "PNG", errors,
+                             group, "{}#slice{}".format(base_name, s),
+                             type_cast=type_cast, slice_index=s):
+                ok += 1
+        note = "{}/{} bound slices written as {}_slice<k>.png".format(
+            ok, emit, base_name)
+        if n_slices > _SLICE_EXPORT_CAP:
+            note += " (capped at {} of {} total slices)".format(
+                _SLICE_EXPORT_CAP, n_slices)
+        fields.append(("array_slices_exported", note))
+
+
 def _save_texture(controller, gfxcap, resource_id, target_path, file_type,
-                  errors, group, target_name, type_cast=None):
+                  errors, group, target_name, type_cast=None, slice_index=None):
     if resource_id is None or _is_null_id(resource_id):
         errors.add(group, target_name, "null resource id")
         return False
@@ -1573,6 +1687,11 @@ def _save_texture(controller, gfxcap, resource_id, target_path, file_type,
         TS.resourceId = resource_id
         if type_cast is not None:
             TS.typeCast = type_cast
+        if slice_index is not None:
+            try:
+                TS.slice.sliceIndex = int(slice_index)
+            except Exception:
+                pass
         ft = getattr(gfxcap, "FileType", None)
         if ft is not None:
             mapped = getattr(ft, file_type, None)
@@ -2388,6 +2507,8 @@ def _export_om_target(om_dir, controller, gfxcap, view, errors, name, label,
                            prefix + "_png", name, type_cast=type_cast)
     fields.append(("exr", "OK" if exr_ok else "FAILED"))
     fields.append(("png", "OK" if png_ok else "FAILED"))
+    _augment_texture_md(fields, controller, gfxcap, view, rid, type_cast,
+                        om_dir, name, errors, prefix + "_slice")
     _append_format_caveats(fields, _format_str(getattr(view, "format", None)))
     _write_md(md, _md_header(label, fields))
     return exr_ok or png_ok
@@ -3212,27 +3333,82 @@ def _rt_size_from_textures(rid, tex_lookup):
     return "{}x{}".format(w, h)
 
 
-def _srv_ids_for_pipe(controller, gfxcap):
-    """Cheap collection of the bound SRV resource IDs across all stages,
-    pulled from descriptor access. Used to build a per-event bind
-    fingerprint. Returns a tuple of stringified ResourceIds, sorted."""
+def _resource_io_for_pipe(controller, gfxcap, pipe, res_lookup, tex_lookup):
+    """Per-event resource I/O for the dataflow table (`resource_io.tsv`).
+
+    Returns a list of dicts: {direction, kind, rid, name, dims}.
+      direction: "read" (SRV), "readwrite" (UAV), "write" (RT / DSV)
+      kind:      "srv" | "uav" | "rt" | "dsv"
+      rid:       stringified ResourceId
+      dims:      "WxH" for textures, "" otherwise
+
+    Reads / read-writes come from the unified descriptor-access API and
+    writes from the pipe's outputMerger -- both abstractions work across
+    D3D11 / D3D12 / Vulkan, so this is API-agnostic. This single function
+    also supplies the SRV-id set the bind fingerprint needs, so the
+    descriptor walk (the expensive part) happens once per event.
+    """
+    io = []
+    seen = set()  # (direction, rid_str) dedupe
+
+    def _dims(rid):
+        t = tex_lookup.get(rid)
+        if t is None:
+            return ""
+        w = getattr(t, "width", 0) or 0
+        h = getattr(t, "height", 0) or 0
+        return "{}x{}".format(w, h) if (w or h) else ""
+
+    def _add(direction, kind, rid):
+        if rid is None or _is_null_id(rid):
+            return
+        rid_s = str(rid)
+        if (direction, rid_s) in seen:
+            return
+        seen.add((direction, rid_s))
+        io.append({
+            "direction": direction, "kind": kind, "rid": rid_s,
+            "name": _resource_name(res_lookup, rid, default=""),
+            "dims": _dims(rid),
+        })
+
+    # ---- reads / read-writes via descriptor access ----
     try:
         accesses = list(controller.GetDescriptorAccess())
     except Exception:
-        return tuple()
-    ids = set()
+        accesses = []
     for acc in accesses:
         kind = _desc_kind(getattr(acc, "type", None))
-        if kind not in ("srv", "imagesampler", "uav"):
+        if kind == "uav":
+            direction, k = "readwrite", "uav"
+        elif kind in ("srv", "imagesampler"):
+            direction, k = "read", "srv"
+        else:
             continue
-        # We need the resource id, which lives on the descriptor itself.
         desc = _fetch_one_descriptor(controller, gfxcap, acc, sampler=False)
         if desc is None:
             continue
-        rid = getattr(desc, "resource", None)
-        if rid is not None and not _is_null_id(rid):
-            ids.add(str(rid))
-    return tuple(sorted(ids))
+        _add(direction, k, getattr(desc, "resource", None))
+
+    # ---- writes via output merger ----
+    if pipe is not None:
+        om = getattr(pipe, "outputMerger", None)
+        if om is not None:
+            for rt in (getattr(om, "renderTargets", []) or []):
+                _add("write", "rt", getattr(rt, "resource", None))
+            depth = getattr(om, "depthTarget", None)
+            if depth is not None:
+                _add("write", "dsv", getattr(depth, "resource", None))
+
+    return io
+
+
+def _srv_ids_from_io(io):
+    """Stringified ResourceId set the bind fingerprint consumes: the
+    read + read-write resources (SRV + UAV), sorted. Derived from the
+    already-collected io so we don't walk descriptors twice."""
+    return tuple(sorted(set(
+        e["rid"] for e in io if e["direction"] in ("read", "readwrite"))))
 
 
 def _bind_fingerprint(shader_names, rt0_id, srv_ids):
@@ -3310,7 +3486,9 @@ def _pipeline_state_brief(pipe):
         stencil_ref       int as string; empty when stencil=n (same
                           rationale: API field is stale when off)
         stencil_func      short enum (front face); empty when stencil=n
-        cull              "back" / "front" / "none" (lower-cased)
+        cull              lower-cased cull-mode enum: "back" / "front" /
+                          "nocull" / "frontandback" (note: "nocull",
+                          not "none")
     """
     rec = {
         "rt0_blend_color": "", "rt0_blend_alpha": "", "rt0_blend_mask": "",
@@ -3409,9 +3587,11 @@ def _make_event_record(a, parents, controller, gfxcap, res_lookup,
         "indirect": "yes" if (flags_int & _AF_INDIRECT) else "",
         "bind_fp": "",
         "hint": "",
-        # internal-only fields (not written to TSV but used by md writers)
+        # internal-only fields (not written to events.tsv; consumed by the
+        # md writers and the resource_io.tsv writer)
         "_rt_ids": tuple(),
         "_dsv_id": None,
+        "_io": [],
     }
 
     # dispatch dimensions
@@ -3461,12 +3641,18 @@ def _make_event_record(a, parents, controller, gfxcap, res_lookup,
     rec["_rt_ids"]    = rt_ids
     rec["_dsv_id"]    = dsv_id
 
-    srv_ids = _srv_ids_for_pipe(controller, gfxcap)
+    io = _resource_io_for_pipe(controller, gfxcap, pipe, res_lookup, tex_lookup)
+    rec["_io"] = io
+    srv_ids = _srv_ids_from_io(io)
     rt0_id = rt_ids[0] if rt_ids else None
     rec["bind_fp"] = _bind_fingerprint(snames, rt0_id, srv_ids)
 
     # Cross-EID grep affordances: blend / depth / stencil / cull on rt0.
-    rec.update(_pipeline_state_brief(pipe))
+    # Only meaningful for the rasterizing classes -- a compute dispatch /
+    # clear / copy carries whatever OM + raster state happened to be bound,
+    # which would be a stale false positive for `$18 ~ /blend/`-style awk.
+    if cls in ("draw", "mesh_dispatch"):
+        rec.update(_pipeline_state_brief(pipe))
 
     rec["hint"] = _classify_hint(cls, mods, rec["num_indices"],
                                  rec["num_instances"], n_rts,
@@ -3501,6 +3687,45 @@ def _write_events_tsv(out_dir, records):
         for r in records:
             row = [_tsv_escape(r.get(c, "")) for c in _EVENTS_TSV_COLUMNS]
             fp.write("\t".join(row) + "\n")
+    return path
+
+
+_RESOURCE_IO_TSV_COLUMNS = [
+    "eid", "direction", "kind", "resource_id", "resource_name", "dims",
+]
+
+
+def _write_resource_io_tsv(out_dir, records):
+    """Long-format dataflow join table: one row per (event, bound
+    resource). This is the grep target for *both* directions of the
+    producer/consumer question that previously needed an ad-hoc probe:
+
+        # every EID that READS resource 12345 (consumers)
+        awk -F'\\t' '$4=="12345" && $2=="read"' resource_io.tsv
+
+        # every EID that WRITES resource 12345 (producers)
+        awk -F'\\t' '$4=="12345" && $2=="write"' resource_io.tsv
+
+        # the full I/O of one event
+        awk -F'\\t' '$1=="4302"' resource_io.tsv
+
+    Populated only in enriched mode; empty (header-only) in --shallow.
+    """
+    path = out_dir / "resource_io.tsv"
+    with path.open("w", encoding="utf-8") as fp:
+        fp.write("\t".join(_RESOURCE_IO_TSV_COLUMNS) + "\n")
+        for r in records:
+            eid = r["eid"]
+            for e in r.get("_io", ()) or ():
+                row = [
+                    str(eid),
+                    e.get("direction", ""),
+                    e.get("kind", ""),
+                    _tsv_escape(e.get("rid", "")),
+                    _tsv_escape(e.get("name", "")),
+                    e.get("dims", ""),
+                ]
+                fp.write("\t".join(row) + "\n")
     return path
 
 
@@ -3788,11 +4013,17 @@ def _write_index_readme(out_dir, records, rdc, controller, shader_catalog,
         "| stencil | `y` / `n` (stencil test enabled) |",
         "| stencil_ref | front-face stencil reference value (int). Empty when `stencil=n`. |",
         "| stencil_func | front-face stencil compare op. Empty when `stencil=n`. |",
-        "| cull | `back` / `front` / `none` |",
+        "| cull | `back` / `front` / `nocull` / `frontandback` (lower-cased enum; note `nocull`, not `none`) |",
         "| num_indices / num_instances / dispatch_xyz | draw/dispatch counts |",
         "| indirect | `yes` if indirect call |",
         "| bind_fp | 8-hex hash of (shader names + rt0 + sorted SRV ids); same bind_fp == same kind of draw |",
         "| hint | cheap heuristic tag: fullscreen / instanced_batch / compute / clear / copy / indirect |",
+        "",
+        "The pipeline-state columns (`rt0_blend_*` .. `cull`) are populated "
+        "only for the rasterizing classes (`draw`, `mesh_dispatch`); they "
+        "are blank for `dispatch` / `clear` / `copy` / etc. The full "
+        "input/output set per event lives in `resource_io.tsv` (see below) "
+        "-- this table carries only the first render target.",
         "",
         "## frame breakdown",
         "",
@@ -3901,7 +4132,7 @@ def _write_index_readme(out_dir, records, rdc, controller, shader_catalog,
         "awk -F'\\t' 'NR>1 && $24==\"y\" && $25==\"128\"' EVENTS",
         "",
         "# two-sided draws (hair, foliage, particles)",
-        "awk -F'\\t' 'NR>1 && $27==\"none\"' EVENTS",
+        "awk -F'\\t' 'NR>1 && $27==\"nocull\"' EVENTS",
         "",
         "# combine: transparent draws into a specific RT",
         "awk -F'\\t' 'NR>1 && $18 ~ /SrcAlpha/ && $13 ~ /MainHDR/' EVENTS",
@@ -3921,13 +4152,33 @@ def _write_index_readme(out_dir, records, rdc, controller, shader_catalog,
         "awk -F'\\t' '$33==\"fullscreen\"' EVENTS",
         "```",
         "",
+        "**Dataflow (who reads / writes a resource)** -- run against "
+        "`resource_io.tsv` (cols: eid, direction, kind, resource_id, "
+        "resource_name, dims). Replace IO with its path:",
+        "",
+        "```sh",
+        "# every event that READS resource X (consumers)",
+        "awk -F'\\t' '$4==\"ResourceId::28255\" && $2==\"read\"' IO",
+        "",
+        "# every event that WRITES resource X (producers)",
+        "awk -F'\\t' '$4==\"ResourceId::7496\" && $2==\"write\"' IO",
+        "",
+        "# the full input/output set of one event",
+        "awk -F'\\t' '$1==\"1505\"' IO",
+        "",
+        "# find a resource id by name, then pivot to its EIDs",
+        "grep -F 'AnimationTexture' IO | cut -f4 | sort -u",
+        "```",
+        "",
         "## files",
         "",
-        "- `events.tsv` -- main grep target",
+        "- `events.tsv` -- main grep target (one row per event)",
+        "- `resource_io.tsv` -- dataflow join table (one row per "
+        "event+resource); grep both directions of who-reads/writes-what",
         "- `events.md` -- same data grouped by marker_path",
         "- `shaders.tsv` -- unique shader catalogue (use to pick a "
         "representative EID for each shader)",
-        "- `render_targets.md` -- per-RT EID lifecycle",
+        "- `render_targets.md` -- per-RT EID lifecycle (write side)",
         "- `markers.md` -- marker tree with EID ranges per scope",
         "",
     ])
@@ -4019,6 +4270,7 @@ def cmd_list(args):
             next_progress = (i + 1) + 100
 
     tsv_path = _write_events_tsv(out, records)
+    _write_resource_io_tsv(out, records)
     _shaders_path, shader_catalog = _write_shaders_tsv(out, records)
     _write_render_targets_md(out, records, res_lookup, tex_lookup)
     _write_markers_md(out, all_walk)
