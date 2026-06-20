@@ -401,6 +401,308 @@ def _export_shader_files(stage_dir, controller, gfxcap, pipe_resource_id,
     return results
 
 
+# ===========================================================================
+# HLSL post-process
+# ===========================================================================
+# Two textual rewrites applied to the raw spirv-cross output of
+# HLSLDecompiler.exe (dxbc2dxil -> dxil-spirv -> spirv-cross) before the
+# .hlsl lands on disk. Both address spirv-cross output that is correct
+# against the original bytecode but bites at downstream fxc recompile
+# time -- specifically the modding / asset-reauthoring flow.
+#
+# Both transforms are:
+#   - idempotent (running them twice == running them once),
+#   - no-op when their trigger pattern is absent (byte-identical output),
+#   - conservative (any ambiguity -> leave the original text alone).
+#
+# They are therefore safe to run unconditionally on every decompiled shader.
+
+_HLSL_TEMP_DEF_RE = re.compile(
+    r'^[ \t]*(?:\w[\w<>]*[ \t]+)?(_\d+)[ \t]*=[ \t]*(.+?);[ \t]*\r?$',
+    re.MULTILINE)
+_HLSL_CB_REINTERP_RE = re.compile(r'asuint\((CB\d+_m0\[\d+u\])\)\.([xyzw])')
+_HLSL_TEMP_NAME_RE = re.compile(r'_\d+\Z')
+
+
+def _hlsl_scan_operand_backward(s, end):
+    """Find an HLSL operand whose end-of-token is at index `end` (exclusive),
+    after skipping trailing whitespace. The operand is either an SSA temp
+    `_N` or a value-cast `int(...)` / `uint(...)` with balanced parens.
+    Returns (start_idx, operand_text) or (None, None) if unambiguous.
+
+    Conservative: returns (None, None) on any ambiguity. Never raises.
+    Used by fix_integer_cbuffer_compares to locate the operand on the
+    LEFT of `<op> asuint(CB).c`."""
+    i = end - 1
+    while i >= 0 and s[i] in ' \t\r\n':
+        i -= 1
+    if i < 0:
+        return None, None
+
+    if s[i] == ')':
+        depth, j = 1, i - 1
+        while j >= 0 and depth > 0:
+            ch = s[j]
+            if ch == ')':
+                depth += 1
+            elif ch == '(':
+                depth -= 1
+            j -= 1
+        if depth != 0:
+            return None, None
+        paren_open = j + 1
+        k = paren_open - 1
+        while k >= 0 and (s[k].isalnum() or s[k] == '_'):
+            k -= 1
+        ident = s[k+1:paren_open]
+        # Require an exact `int` / `uint` keyword; anything longer (e.g.
+        # `asuint`, `myint`) means this is not the operand class we rewrite.
+        if ident not in ('int', 'uint'):
+            return None, None
+        return k + 1, s[k+1:i+1]
+
+    if s[i].isdigit():
+        k = i
+        while k > 0 and s[k-1].isdigit():
+            k -= 1
+        if k > 0 and s[k-1] == '_':
+            # Left boundary: char before '_' must not extend the identifier.
+            if k - 2 < 0 or not (s[k-2].isalnum() or s[k-2] == '_'):
+                return k - 1, s[k-1:i+1]
+        return None, None
+
+    return None, None
+
+
+def _hlsl_scan_operand_forward(s, start):
+    """Mirror of `_hlsl_scan_operand_backward`. Returns (end_idx,
+    operand_text) or (None, None). Used to locate the operand on the
+    RIGHT of `asuint(CB).c <op>`."""
+    i = start
+    while i < len(s) and s[i] in ' \t\r\n':
+        i += 1
+    if i >= len(s):
+        return None, None
+
+    if s[i] == '_':
+        j = i + 1
+        while j < len(s) and s[j].isdigit():
+            j += 1
+        if j == i + 1:
+            return None, None
+        if j < len(s) and (s[j].isalnum() or s[j] == '_'):
+            return None, None
+        return j, s[i:j]
+
+    for kw in ('uint(', 'int('):
+        if s.startswith(kw, i):
+            # Left boundary: must not be the tail of a longer identifier
+            # (e.g. `asuint(` -- never the operand class we rewrite).
+            if i > 0 and (s[i-1].isalnum() or s[i-1] == '_'):
+                continue
+            paren = i + len(kw) - 1  # index of '('
+            depth, j = 1, paren + 1
+            while j < len(s) and depth > 0:
+                ch = s[j]
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                j += 1
+            if depth != 0:
+                return None, None
+            return j, s[i:j]
+
+    return None, None
+
+
+def _hlsl_is_value_int_expr(expr, defs):
+    """True iff `expr` is a value-converted integer (`int(...)` /
+    `uint(int(...))` or an SSA temp resolving to one) -- NOT a bit-
+    reinterpret (`asuint(...)` / `asint(...)`). Resolves SSA temps one
+    level via `defs`. Conservative: any uncertainty -> False."""
+    expr = expr.strip()
+    if _HLSL_TEMP_NAME_RE.match(expr) and expr in defs:
+        expr = defs[expr].strip()
+    if expr.startswith('asuint(') or expr.startswith('asint('):
+        return False
+    if expr.startswith('int(as') or expr.startswith('uint(as'):
+        return False
+    return expr.startswith('uint(int(') or expr.startswith('int(')
+
+
+def fix_integer_cbuffer_compares(hlsl):
+    """Rewrite `asuint(CBn_m0[R]).c <op> INT_VALUE` and its mirror
+    (where `<op>` is `==` or `!=` and `INT_VALUE` is a value-converted
+    integer) to `uint(CBn_m0[R].c) <op> ...`.
+
+    spirv-cross emits a bit-reinterpret (`asuint(CB...).c`) for ftoi/ftou
+    against a float-typed cbuffer slot. That is faithful to the original
+    bytecode, but when the slot is later bound to a Unity float material
+    property whose VALUE is an integer (e.g. 2.0 for a material-id),
+    `asuint(2.0f)` is 0x40000000 instead of 2 and the compare is
+    permanently false -- the material-id branch is dead code, routing
+    skin pixels through the wrong tone curve etc.
+
+    Trigger condition: the OTHER operand must be a value-converted integer
+    (`int(...)` / `uint(int(...))`, or an SSA temp resolving to one), NOT a
+    bit-reinterpret. Genuine bit-select idioms
+    (`asfloat(cond ? asuint(a) : asuint(b))`) are therefore never touched.
+
+    Conservative throughout: bit-select idioms
+    (`asfloat(cond ? asuint(a) : asuint(b))`) are never touched, and an
+    SSA temp that resolves to a bit-reinterpret rather than a value-cast
+    blocks the rewrite for that comparison."""
+    if not hlsl or 'asuint(CB' not in hlsl:
+        return hlsl
+
+    defs = {m.group(1): m.group(2).strip()
+            for m in _HLSL_TEMP_DEF_RE.finditer(hlsl)}
+
+    def _rewrite_right(text):
+        """`asuint(CB).c <op> <value-int>` -> `uint(CB.c) <op> ...`"""
+        out, i = [], 0
+        for m in _HLSL_CB_REINTERP_RE.finditer(text):
+            cb_start, cb_end = m.start(), m.end()
+            cb_ref, cb_chan = m.group(1), m.group(2)
+            j = cb_end
+            while j < len(text) and text[j] in ' \t\r\n':
+                j += 1
+            if j + 2 > len(text) or text[j:j+2] not in ('==', '!='):
+                continue
+            op_end = j + 2
+            r_end, r_expr = _hlsl_scan_operand_forward(text, op_end)
+            if r_expr is None or not _hlsl_is_value_int_expr(r_expr, defs):
+                continue
+            out.append(text[i:cb_start])
+            out.append('uint({}.{})'.format(cb_ref, cb_chan))
+            out.append(text[cb_end:r_end])
+            i = r_end
+        out.append(text[i:])
+        return ''.join(out)
+
+    def _rewrite_left(text):
+        """`<value-int> <op> asuint(CB).c` -> `... <op> uint(CB.c)`"""
+        out, i = [], 0
+        for m in _HLSL_CB_REINTERP_RE.finditer(text):
+            cb_start, cb_end = m.start(), m.end()
+            cb_ref, cb_chan = m.group(1), m.group(2)
+            j = cb_start - 1
+            while j >= 0 and text[j] in ' \t\r\n':
+                j -= 1
+            if j < 1 or text[j-1:j+1] not in ('==', '!='):
+                continue
+            op_start = j - 1
+            l_start, l_expr = _hlsl_scan_operand_backward(text, op_start)
+            if l_expr is None or not _hlsl_is_value_int_expr(l_expr, defs):
+                continue
+            out.append(text[i:cb_start])
+            out.append('uint({}.{})'.format(cb_ref, cb_chan))
+            i = cb_end
+        out.append(text[i:])
+        return ''.join(out)
+
+    return _rewrite_left(_rewrite_right(hlsl))
+
+
+_HLSL_STRUCT_RE = re.compile(r'(struct\s+\w+\s*\{)(.*?)(\})', re.DOTALL)
+_HLSL_PS_MEMBER_RE = re.compile(
+    r'(?P<lead>\r?\n[ \t]*)'
+    r'(?P<mods>(?:(?:linear|centroid|nointerpolation|noperspective|sample)[ \t]+)*)'
+    r'(?P<type>[A-Za-z_]\w*)[ \t]+'
+    r'(?P<name>[A-Za-z_]\w*)[ \t]*:[ \t]*(?P<sem>[A-Za-z_]\w*)[ \t]*;')
+
+
+def harmonize_packed_interpolation(hlsl):
+    """When two fragment-input members share a semantic -- the
+    authoritative signal that they alias the same packed DXBC register --
+    and exactly ONE distinct interpolation modifier is present across the
+    group, propagate that modifier to the modifier-less member(s).
+
+    Why: dxil-spirv maps both halves of a packed DXBC input register
+    (e.g. reg5.x and reg5.yzw) to the same SPIR-V location, so spirv-cross
+    emits two struct members with the SAME semantic. If they carry
+    differing interpolation modes, fxc cannot repack them at recompile
+    and relocates the modified interpolant; the vertex output (no
+    modifiers) still packs them together, so the resulting VS-output and
+    PS-input signatures disagree on register/component -> broken
+    inter-stage routing -> garbage at runtime.
+
+    Conservative:
+      - only structs that ALREADY carry at least one interpolation
+        modifier are touched (so vertex outputs, which have no modifiers,
+        are never given an illegal modifier);
+      - groups with TWO OR MORE distinct modifiers are LEFT ALONE
+        (no guessing -- fxc would have flagged the original packing
+        anyway).
+
+    Conservative throughout: only structs that already carry at least
+    one interpolation modifier are touched, and groups whose modifier
+    set has more than one distinct value are left untouched
+    (no guessing)."""
+    if not hlsl or '{' not in hlsl:
+        return hlsl
+
+    def _transform(match):
+        header, body, footer = match.group(1), match.group(2), match.group(3)
+        members = list(_HLSL_PS_MEMBER_RE.finditer(body))
+        if not members:
+            return match.group(0)
+
+        has_interp = False
+        mods_by_sem = {}
+        count_by_sem = {}
+        for mm in members:
+            mods = mm.group('mods').strip()
+            sem = mm.group('sem')
+            count_by_sem[sem] = count_by_sem.get(sem, 0) + 1
+            if mods:
+                has_interp = True
+                mods_by_sem.setdefault(sem, set()).add(mods)
+        if not has_interp:
+            return match.group(0)
+
+        target = {}
+        for sem, cnt in count_by_sem.items():
+            if cnt < 2:
+                continue
+            modset = mods_by_sem.get(sem)
+            if not modset or len(modset) != 1:
+                continue
+            target[sem] = next(iter(modset))
+        if not target:
+            return match.group(0)
+
+        # Splice in the missing modifier(s). Iterate in original order so
+        # the resulting body preserves member ordering and whitespace.
+        out, i = [], 0
+        for mm in members:
+            sem = mm.group('sem')
+            mods = mm.group('mods').strip()
+            tgt = target.get(sem)
+            if tgt is None or mods:
+                continue
+            type_start = mm.start('type')
+            out.append(body[i:type_start])
+            out.append(tgt + ' ')
+            i = type_start
+        out.append(body[i:])
+        return header + ''.join(out) + footer
+
+    return _HLSL_STRUCT_RE.sub(_transform, hlsl)
+
+
+def postprocess_hlsl(hlsl):
+    """Apply every HLSL decompile post-process in order. Each pass is
+    idempotent and a no-op on shaders that don't carry the relevant
+    pattern, so this is safe to invoke unconditionally."""
+    if not hlsl:
+        return hlsl
+    hlsl = fix_integer_cbuffer_compares(hlsl)
+    hlsl = harmonize_packed_interpolation(hlsl)
+    return hlsl
+
+
 def _decompile_hlsl(dxbc_path, hlsl_path, errors, stage_short, bundle_root):
     """Run the bundled HLSLDecompiler against shader.dxbc.
 
@@ -408,6 +710,12 @@ def _decompile_hlsl(dxbc_path, hlsl_path, errors, stage_short, bundle_root):
         HLSLDecompiler.exe <input> <-dxbc|-dxil|-spirv> [output.hlsl]
     The exe shells out to dxbc2dxil.exe via the system PATH so we prepend
     the plugin dir to env["PATH"].
+
+    Post-process: after the decompile lands on disk, the raw spirv-cross
+    output is fed through `postprocess_hlsl` (asuint -> uint for value-int
+    cbuffer compares, packed-interpolation harmonize). Both transforms
+    are idempotent and a no-op when their trigger pattern is absent, so
+    they're applied unconditionally.
     """
     bat = bundle_root / "plugins" / "hlsl-decompiler" / "HLSLDecompiler.bat"
     if not bat.exists():
@@ -476,6 +784,20 @@ def _decompile_hlsl(dxbc_path, hlsl_path, errors, stage_short, bundle_root):
         except Exception as e:
             errors.add("shader_hlsl", stage_short, "copy failed", e)
             return False
+
+    # Post-process: spirv-cross output corrections (asuint -> uint for
+    # value-int cbuffer compares; packed-interpolation harmonize).
+    # Failures here MUST NOT invalidate the raw decompile -- the raw
+    # output is already on disk and is the right fallback if a postpass
+    # mis-parses something.
+    try:
+        raw = hlsl_path.read_text(encoding="utf-8")
+        fixed = postprocess_hlsl(raw)
+        if fixed != raw:
+            hlsl_path.write_text(fixed, encoding="utf-8")
+    except Exception as e:
+        errors.add("shader_hlsl", stage_short, "postprocess error (raw HLSL kept)", e)
+
     return True
 
 

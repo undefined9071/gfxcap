@@ -127,9 +127,9 @@ state; expect ~minutes for 10k-event captures.
                            know what a draw renders to (the main HDR
                            buffer, a shadow map) but not which EID.
   markers.md             ← marker tree with EID range per scope.
-                           Empty if the engine inserts no debug
-                           markers (common for HoYo / Genshin-style
-                           Unity titles).
+                           Empty when the engine emits no debug
+                           markers (common for shipping Unity / Unreal
+                           builds with marker streams compiled out).
 ```
 
 ### events.tsv columns
